@@ -23,7 +23,10 @@ if str(SRC_ROOT) not in sys.path:
 
 from cosmic_memory.domain.enums import MemoryKind
 from cosmic_memory.domain.models import MemoryProvenance, PassiveRecallRequest, WriteMemoryRequest
+from cosmic_memory.embeddings import PerplexityStandardEmbeddingService
+from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.embeddings.hash import HashEmbeddingService
+from cosmic_memory.env import load_env_file
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import InMemoryGraphStore
 from cosmic_memory.index.qdrant import (
@@ -62,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["inprocess", "http"], default="inprocess")
     parser.add_argument("--base-url", default=None, help="Required for HTTP mode.")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=["perplexity", "hash"],
+        default="perplexity",
+    )
+    parser.add_argument("--embedding-model", default="pplx-embed-v1-4b")
+    parser.add_argument("--embedding-dimensions", type=int, default=1024)
+    parser.add_argument("--embed-batch-size", type=int, default=128)
+    parser.add_argument("--embed-max-parallel", type=int, default=4)
     parser.add_argument("--records", type=int, default=400)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=20)
@@ -244,35 +256,39 @@ async def seed_http_service(client: httpx.AsyncClient, total_records: int) -> No
 
 
 async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
+    load_env_file()
     graph_store = InMemoryGraphStore() if args.graph_backend == "memory" else None
+    embedding_service = build_embedding_service(args)
     with benchmark_workdir(args.data_dir) as tmp:
         if _has_fastembed():
             index = QdrantHybridMemoryIndex(
-                embedding_service=HashEmbeddingService(dimensions=256),
+                embedding_service=embedding_service,
                 sparse_encoder=FastEmbedSparseEncoder(),
                 path=str(Path(tmp) / "qdrant"),
-                vector_size=256,
+                vector_size=embedding_service.dimensions,
             )
         elif _supports_qdrant_native_bm25():
             index = QdrantHybridMemoryIndex(
-                embedding_service=HashEmbeddingService(dimensions=256),
+                embedding_service=embedding_service,
                 path=str(Path(tmp) / "qdrant"),
-                vector_size=256,
+                vector_size=embedding_service.dimensions,
             )
         else:
             index = QdrantHybridMemoryIndex(
-                embedding_service=HashEmbeddingService(dimensions=256),
+                embedding_service=embedding_service,
                 sparse_encoder=SimpleSparseEncoder(),
                 path=str(Path(tmp) / "qdrant"),
-                vector_size=256,
+                vector_size=embedding_service.dimensions,
             )
         service = FilesystemMemoryService(
             tmp,
-            passive_index=index,
+            passive_index=None,
             graph_store=graph_store,
             passive_graph_timeout_seconds=args.graph_timeout_ms / 1000.0,
         )
         await seed_inprocess_service(service, args.records)
+        service.passive_index = index
+        await service.sync_index()
         report = await _exercise_passive_recall(
             lambda case: service.passive_recall(
                 PassiveRecallRequest(
@@ -287,6 +303,7 @@ async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
             concurrency=args.concurrency,
         )
         await index.close()
+        await embedding_service.close()
         return report
 
 
@@ -404,6 +421,18 @@ def _percentile(values: list[float], percentile: float) -> float:
     sorted_values = sorted(values)
     index = max(min(int(round((len(sorted_values) - 1) * percentile)), len(sorted_values) - 1), 0)
     return sorted_values[index]
+
+
+def build_embedding_service(args: argparse.Namespace) -> EmbeddingService:
+    if args.embedding_backend == "hash":
+        return HashEmbeddingService(dimensions=args.embedding_dimensions)
+
+    return PerplexityStandardEmbeddingService(
+        model_name=args.embedding_model,
+        dimensions=args.embedding_dimensions,
+        batch_size=args.embed_batch_size,
+        max_parallel_requests=args.embed_max_parallel,
+    )
 
 
 @contextmanager
