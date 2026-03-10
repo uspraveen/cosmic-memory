@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime
@@ -57,6 +58,8 @@ class Neo4jGraphStore:
         self.driver = AsyncGraphDatabase.driver(uri, auth=(username, password))
         self.database = database
         self._ready = False
+        self._cache_lock = asyncio.Lock()
+        self._search_cache: InMemoryGraphStore | None = None
 
     async def ingest_document(self, document: GraphDocument) -> GraphIngestResult:
         await self._ensure_ready()
@@ -93,12 +96,14 @@ class Neo4jGraphStore:
                 )
                 relation_ids.append(edge.relation_id)
 
-        return GraphIngestResult(
+        result = GraphIngestResult(
             memory_id=document.memory_id,
             entity_ids=sorted(set(ref_to_entity_id.values())),
             relation_ids=sorted(set(relation_ids)),
             resolution_events=resolution_events,
         )
+        await self._cache_ingest_document(document)
+        return result
 
     async def remove_memory(self, memory_id: str) -> None:
         await self._ensure_ready()
@@ -164,6 +169,7 @@ class Neo4jGraphStore:
                             """,
                             node_id=row["node_id"],
                         )
+        await self._cache_remove_memory(memory_id)
 
     async def resolve_identity(
         self, candidate: GraphIdentityCandidate
@@ -530,6 +536,16 @@ class Neo4jGraphStore:
 
     async def _load_search_store(self) -> InMemoryGraphStore:
         await self._ensure_ready()
+        if self._search_cache is not None:
+            return self._search_cache
+        async with self._cache_lock:
+            if self._search_cache is not None:
+                return self._search_cache
+            store = await self._hydrate_search_store()
+            self._search_cache = store
+            return store
+
+    async def _hydrate_search_store(self) -> InMemoryGraphStore:
         store = InMemoryGraphStore()
         async with self.driver.session(database=self.database) as session:
             entity_result = await session.run(
@@ -597,6 +613,19 @@ class Neo4jGraphStore:
         store._key_to_entities = key_to_entities
         store._entity_to_relations = entity_to_relations
         return store
+
+    async def _cache_ingest_document(self, document: GraphDocument) -> None:
+        async with self._cache_lock:
+            if self._search_cache is None:
+                self._search_cache = await self._hydrate_search_store()
+                return
+            await self._search_cache.ingest_document(document)
+
+    async def _cache_remove_memory(self, memory_id: str) -> None:
+        async with self._cache_lock:
+            if self._search_cache is None:
+                return
+            await self._search_cache.remove_memory(memory_id)
 
 
 def _new_entity(memory_id: str, document_entity, *, provisional: bool) -> GraphEntityNode:
