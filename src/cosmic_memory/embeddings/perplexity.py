@@ -6,6 +6,7 @@ import asyncio
 import base64
 import math
 import os
+import random
 from array import array
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ class PerplexityStandardEmbeddingService:
         encoding_format: str = "base64_int8",
         normalize: bool = True,
         timeout: float | None = 30.0,
+        max_retries: int = 4,
+        retry_base_seconds: float = 0.75,
+        retry_max_seconds: float = 8.0,
         client: Any | None = None,
     ) -> None:
         self.model_name = model_name
@@ -49,6 +53,9 @@ class PerplexityStandardEmbeddingService:
         self.encoding_format = encoding_format
         self.normalize = normalize
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_base_seconds = retry_base_seconds
+        self.retry_max_seconds = retry_max_seconds
         self._owns_client = client is None
         self._client = client or self._build_client(api_key)
 
@@ -118,7 +125,7 @@ class PerplexityStandardEmbeddingService:
             if self.timeout is not None:
                 kwargs["timeout"] = self.timeout
 
-            response = await self._client.embeddings.create(**kwargs)
+            response = await self._create_with_retry(**kwargs)
 
         items: list[EmbeddingItem] = []
         for position, entry in enumerate(response.data or []):
@@ -145,6 +152,21 @@ class PerplexityStandardEmbeddingService:
             items=items,
             usage=_parse_usage(getattr(response, "usage", None)),
         )
+
+    async def _create_with_retry(self, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return await self._client.embeddings.create(**kwargs)
+            except Exception as exc:
+                if attempt >= self.max_retries or not _is_retryable_error(exc):
+                    raise
+                delay = min(
+                    self.retry_max_seconds,
+                    self.retry_base_seconds * (2**attempt),
+                ) * (1.0 + (random.random() * 0.15))
+                await asyncio.sleep(delay)
+                attempt += 1
 
     @staticmethod
     def _build_client(api_key: str | None):
@@ -274,3 +296,39 @@ def _sum_optional(values) -> int | float | None:
         total += value
         found = True
     return total if found else None
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if response_status in {408, 409, 425, 429, 500, 502, 503, 504}:
+        return True
+
+    name = exc.__class__.__name__.lower()
+    if any(
+        marker in name
+        for marker in (
+            "ratelimit",
+            "timeout",
+            "connection",
+            "internalserver",
+            "apistatuserror",
+        )
+    ):
+        return True
+
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "rate limit",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "connection reset",
+        )
+    )

@@ -168,6 +168,9 @@ def _build_embedding_service_from_env(*, require_remote: bool = True) -> Embeddi
     max_parallel_requests = int(os.environ.get("COSMIC_MEMORY_EMBED_MAX_PARALLEL", "4"))
     encoding_format = os.environ.get("COSMIC_MEMORY_EMBED_ENCODING", "base64_int8")
     normalize = os.environ.get("COSMIC_MEMORY_EMBED_NORMALIZE", "true").lower() != "false"
+    max_retries = int(os.environ.get("COSMIC_MEMORY_EMBED_MAX_RETRIES", "4"))
+    retry_base_seconds = float(os.environ.get("COSMIC_MEMORY_EMBED_RETRY_BASE_SECONDS", "0.75"))
+    retry_max_seconds = float(os.environ.get("COSMIC_MEMORY_EMBED_RETRY_MAX_SECONDS", "8.0"))
     api_key = os.environ.get("PERPLEXITY_API_KEY") or os.environ.get("PPLX_API_KEY")
     if not api_key:
         if not require_remote:
@@ -184,6 +187,9 @@ def _build_embedding_service_from_env(*, require_remote: bool = True) -> Embeddi
         max_parallel_requests=max_parallel_requests,
         encoding_format=encoding_format,
         normalize=normalize,
+        max_retries=max_retries,
+        retry_base_seconds=retry_base_seconds,
+        retry_max_seconds=retry_max_seconds,
     )
 
 

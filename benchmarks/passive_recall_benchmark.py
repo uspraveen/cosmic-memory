@@ -74,6 +74,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dimensions", type=int, default=1024)
     parser.add_argument("--embed-batch-size", type=int, default=128)
     parser.add_argument("--embed-max-parallel", type=int, default=4)
+    parser.add_argument("--embed-max-retries", type=int, default=4)
+    parser.add_argument("--embed-retry-base-seconds", type=float, default=0.75)
+    parser.add_argument("--embed-retry-max-seconds", type=float, default=8.0)
     parser.add_argument("--records", type=int, default=400)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=20)
@@ -432,6 +435,9 @@ def build_embedding_service(args: argparse.Namespace) -> EmbeddingService:
         dimensions=args.embedding_dimensions,
         batch_size=args.embed_batch_size,
         max_parallel_requests=args.embed_max_parallel,
+        max_retries=args.embed_max_retries,
+        retry_base_seconds=args.embed_retry_base_seconds,
+        retry_max_seconds=args.embed_retry_max_seconds,
     )
 
 

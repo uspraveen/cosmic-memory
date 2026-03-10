@@ -97,6 +97,56 @@ def test_perplexity_embedding_service_batches_and_aggregates_usage():
     asyncio.run(run())
 
 
+def test_perplexity_embedding_service_retries_retryable_errors():
+    class FakeRateLimitError(Exception):
+        status_code = 429
+
+    class FlakyEmbeddingsResource:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise FakeRateLimitError("rate limit exceeded")
+            dimensions = kwargs["dimensions"]
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        index=0,
+                        embedding=_encoded_int8_vector(seed=1, dimensions=dimensions),
+                    )
+                ],
+                usage=None,
+            )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.embeddings = FlakyEmbeddingsResource()
+
+        async def close(self) -> None:
+            return None
+
+    async def run():
+        client = FakeClient()
+        service = PerplexityStandardEmbeddingService(
+            client=client,
+            dimensions=128,
+            max_retries=2,
+            retry_base_seconds=0.0,
+            retry_max_seconds=0.0,
+        )
+
+        response = await service.generate(
+            GenerateEmbeddingsRequest(texts=["alpha"], dimensions=128)
+        )
+
+        assert len(response.items) == 1
+        assert client.embeddings.calls == 2
+
+    asyncio.run(run())
+
+
 def _encoded_int8_vector(*, seed: int, dimensions: int) -> str:
     values = array(
         "b",
