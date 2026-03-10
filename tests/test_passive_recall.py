@@ -71,3 +71,40 @@ def test_passive_recall_prioritizes_agent_notes_over_user_data(tmp_path):
         assert recall.items[0].kind == MemoryKind.AGENT_NOTE
 
     asyncio.run(run())
+
+
+def test_passive_recall_emits_diagnostics_and_score_breakdowns(tmp_path):
+    async def run():
+        service = FilesystemMemoryService(tmp_path)
+        await service.write(
+            WriteMemoryRequest(
+                kind=MemoryKind.CORE_FACT,
+                title="Answer preference",
+                content="User prefers concise answers.",
+                tags=["preference", "current"],
+                provenance=provenance(),
+                metadata={
+                    "canonical_key": "response_style",
+                    "always_include": True,
+                    "confidence": 0.9,
+                },
+            )
+        )
+
+        recall = await service.passive_recall(
+            PassiveRecallRequest(
+                query="What are the current concise answer preferences?",
+                max_results=5,
+                include_diagnostics=True,
+            )
+        )
+
+        assert recall.diagnostics is not None
+        assert recall.diagnostics.timings_ms["service_total_ms"] >= 0
+        assert recall.diagnostics.timings_ms["lexical_search_ms"] >= 0
+        assert recall.diagnostics.flags["index_used"] is False
+        assert recall.diagnostics.flags["graph_assist_requested"] is False
+        assert recall.items[0].score_breakdown is not None
+        assert recall.items[0].score_breakdown["final"] >= recall.items[0].score_breakdown["base"]
+
+    asyncio.run(run())

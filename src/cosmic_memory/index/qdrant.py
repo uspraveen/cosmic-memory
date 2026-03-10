@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from importlib.metadata import version
 import re
+from time import perf_counter
 import uuid
 from collections.abc import Sequence
 
@@ -14,6 +15,7 @@ from cosmic_memory.domain.models import (
     CanonicalMemorySnapshot,
     GenerateEmbeddingsRequest,
     IndexPointState,
+    PassiveRecallDiagnostics,
     PassiveRecallRequest,
     PassiveRecallResponse,
     RecallItem,
@@ -21,9 +23,8 @@ from cosmic_memory.domain.models import (
 from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.index.sparse import SparseEncoder
 from cosmic_memory.retrieval import (
-    kind_priority_bias,
     passive_candidate_limit,
-    recency_bias,
+    recall_item_from_payload,
     rerank_passive_items,
     select_passive_items,
 )
@@ -65,6 +66,7 @@ class QdrantHybridMemoryIndex:
         self.embed_batch_size = embed_batch_size
         self.embed_parallel_requests = embed_parallel_requests
         self.dense_encoding_format = dense_encoding_format
+        self._is_local_path = path is not None and url is None
         self._ready = False
 
         if self.sparse_encoder is None and not _supports_qdrant_native_bm25():
@@ -161,6 +163,11 @@ class QdrantHybridMemoryIndex:
                 "content_hash": snapshot.content_hash or canonical_record_hash(record),
                 "token_count": snapshot.token_count,
                 "content": record.content,
+                "source_kind": record.provenance.source_kind if record.provenance else None,
+                "confidence": record.metadata.get("confidence"),
+                "canonical_key": record.metadata.get("canonical_key"),
+                "always_include": record.metadata.get("always_include"),
+                "supersedes": record.supersedes,
             }
             points.append(
                 self._models.PointStruct(
@@ -249,8 +256,11 @@ class QdrantHybridMemoryIndex:
         self._ready = True
 
     async def search(self, request: PassiveRecallRequest) -> PassiveRecallResponse:
+        started_at = perf_counter()
         await self.ensure_ready()
         candidate_limit = passive_candidate_limit(request.max_results)
+        diagnostics = PassiveRecallDiagnostics() if request.include_diagnostics else None
+        embed_started = perf_counter()
         if self.sparse_encoder is not None:
             dense_task = asyncio.create_task(
                 self.embedding_service.generate(
@@ -279,6 +289,7 @@ class QdrantHybridMemoryIndex:
                 )
             )
             query_sparse = None
+        embed_ms = (perf_counter() - embed_started) * 1000.0
 
         query_dense = dense_result.items[0].vector
 
@@ -296,6 +307,7 @@ class QdrantHybridMemoryIndex:
                 )
             )
 
+        query_started = perf_counter()
         results = await asyncio.to_thread(
             self.client.query_points,
             collection_name=self.collection_name,
@@ -319,7 +331,9 @@ class QdrantHybridMemoryIndex:
             query=self._models.FusionQuery(fusion=self._models.Fusion.RRF),
             limit=candidate_limit,
         )
+        query_ms = (perf_counter() - query_started) * 1000.0
 
+        hydration_started = perf_counter()
         ranked = []
         seen_ids: set[str] = set()
         for point in results.points:
@@ -329,33 +343,52 @@ class QdrantHybridMemoryIndex:
                 continue
             seen_ids.add(memory_id)
 
-            kind = MemoryKind(payload["type"])
             base_score = float(point.score or 0.0)
-            final_score = base_score + kind_priority_bias(kind) + recency_bias(
-                payload.get("updated_at")
-            )
-            ranked.append(
-                RecallItem(
-                    memory_id=memory_id,
-                    kind=kind,
-                    title=payload.get("title"),
-                    content=payload.get("content", ""),
-                    score=final_score,
-                    tags=list(payload.get("tags", [])),
-                    token_count=int(payload.get("token_count") or _approx_token_count(payload.get("content", ""))),
-                )
-            )
+            ranked.append(recall_item_from_payload(payload=payload, score=base_score, point_id=point.id))
+        hydration_ms = (perf_counter() - hydration_started) * 1000.0
 
+        rerank_started = perf_counter()
         ranked = rerank_passive_items(
             ranked,
             query=request.query,
+            include_breakdown=request.include_diagnostics,
         )
+        rerank_ms = (perf_counter() - rerank_started) * 1000.0
+        select_started = perf_counter()
         selected, total_token_count = select_passive_items(
             ranked,
             max_results=request.max_results,
             token_budget=request.token_budget,
         )
-        return PassiveRecallResponse(items=selected, total_token_count=total_token_count)
+        select_ms = (perf_counter() - select_started) * 1000.0
+        total_ms = (perf_counter() - started_at) * 1000.0
+
+        if diagnostics is not None:
+            diagnostics.timings_ms = {
+                "index_total_ms": round(total_ms, 3),
+                "index_embedding_ms": round(embed_ms, 3),
+                "index_query_ms": round(query_ms, 3),
+                "index_hydration_ms": round(hydration_ms, 3),
+                "rerank_ms": round(rerank_ms, 3),
+                "selection_ms": round(select_ms, 3),
+            }
+            diagnostics.counters = {
+                "candidate_limit": candidate_limit,
+                "candidate_count": len(ranked),
+                "selected_count": len(selected),
+            }
+            diagnostics.flags = {
+                "index_used": True,
+                "index_fallback_used": False,
+                "native_sparse_mode": self.sparse_encoder is None,
+                "local_path_index": self._is_local_path,
+            }
+
+        return PassiveRecallResponse(
+            items=selected,
+            total_token_count=total_token_count,
+            diagnostics=diagnostics,
+        )
 
     async def close(self) -> None:
         close = getattr(self.client, "close", None)

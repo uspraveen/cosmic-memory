@@ -30,7 +30,11 @@ def test_filesystem_service_syncs_passive_index_and_uses_it_for_search(tmp_path)
         )
 
         recall = await service.passive_recall(
-            PassiveRecallRequest(query="memory architecture", max_results=5)
+            PassiveRecallRequest(
+                query="memory architecture",
+                max_results=5,
+                include_diagnostics=True,
+            )
         )
 
         assert index.synced
@@ -38,5 +42,8 @@ def test_filesystem_service_syncs_passive_index_and_uses_it_for_search(tmp_path)
         assert index.synced[record.memory_id][0] == RecordStatus.ACTIVE
         assert index.search_requests
         assert recall.items[0].memory_id == "mem_from_index"
+        assert recall.diagnostics is not None
+        assert recall.diagnostics.timings_ms["service_total_ms"] >= 0
+        assert recall.diagnostics.flags["graph_assist_requested"] is False
 
     asyncio.run(run())

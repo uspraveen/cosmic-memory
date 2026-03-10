@@ -148,6 +148,13 @@ class RecallItem(BaseModel):
     score: float
     tags: list[str] = Field(default_factory=list)
     token_count: int | None = None
+    source_kind: str | None = None
+    updated_at: datetime | None = None
+    confidence: float | None = None
+    canonical_key: str | None = None
+    always_include: bool | None = None
+    supersedes: str | None = None
+    score_breakdown: dict[str, float] | None = None
 
 
 class PassiveRecallRequest(BaseModel):
@@ -155,11 +162,20 @@ class PassiveRecallRequest(BaseModel):
     kinds: list[MemoryKind] | None = None
     max_results: int = 8
     token_budget: int = 12_000
+    include_diagnostics: bool = False
+
+
+class PassiveRecallDiagnostics(BaseModel):
+    timings_ms: dict[str, float] = Field(default_factory=dict)
+    counters: dict[str, int] = Field(default_factory=dict)
+    flags: dict[str, bool] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
 
 
 class PassiveRecallResponse(BaseModel):
     items: list[RecallItem] = Field(default_factory=list)
     total_token_count: int = 0
+    diagnostics: PassiveRecallDiagnostics | None = None
 
 
 class IndexPointState(BaseModel):

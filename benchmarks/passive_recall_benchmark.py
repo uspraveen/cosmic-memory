@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import random
 import statistics
@@ -52,6 +53,9 @@ class BenchmarkSample:
     total_token_count: int
     result_count: int
     within_budget: bool
+    timings_ms: dict[str, float]
+    counters: dict[str, int]
+    flags: dict[str, bool]
 
 
 def parse_args() -> argparse.Namespace:
@@ -241,7 +245,7 @@ async def seed_http_service(client: httpx.AsyncClient, total_records: int) -> No
 
 async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
     graph_store = InMemoryGraphStore() if args.graph_backend == "memory" else None
-    with tempfile.TemporaryDirectory(prefix="cosmic-memory-bench-", dir=args.data_dir) as tmp:
+    with benchmark_workdir(args.data_dir) as tmp:
         if _has_fastembed():
             index = QdrantHybridMemoryIndex(
                 embedding_service=HashEmbeddingService(dimensions=256),
@@ -275,6 +279,7 @@ async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
                     query=case.query,
                     max_results=case.max_results,
                     token_budget=case.token_budget,
+                    include_diagnostics=True,
                 )
             ),
             warmup=args.warmup,
@@ -297,6 +302,7 @@ async def run_http_benchmark(args: argparse.Namespace) -> dict:
                     query=case.query,
                     max_results=case.max_results,
                     token_budget=case.token_budget,
+                    include_diagnostics=True,
                 ).model_dump(mode="json"),
             ),
             warmup=args.warmup,
@@ -345,6 +351,9 @@ async def _exercise_passive_recall(
             sum(1 for sample in samples if sample.within_budget) / max(len(samples), 1),
             4,
         ),
+        "timing_breakdown_ms": _aggregate_timing_stats(samples),
+        "counter_stats": _aggregate_counter_stats(samples),
+        "flag_rates": _aggregate_flag_rates(samples),
         "cases": [asdict(sample) for sample in samples[: len(cases)]],
         "budget_ok_samples": sum(1 for sample in samples if sample.within_budget),
     }
@@ -363,6 +372,7 @@ async def _invoke_case(caller, case: BenchmarkCase, *, http_mode: bool) -> Bench
         payload = response.model_dump(mode="json")
 
     items = payload.get("items", [])
+    diagnostics = payload.get("diagnostics") or {}
     top1_hit = bool(items) and _item_matches(items[0], case)
     any_hit = any(_item_matches(item, case) for item in items)
     return BenchmarkSample(
@@ -373,6 +383,9 @@ async def _invoke_case(caller, case: BenchmarkCase, *, http_mode: bool) -> Bench
         total_token_count=int(payload.get("total_token_count", 0)),
         result_count=len(items),
         within_budget=int(payload.get("total_token_count", 0)) <= case.token_budget,
+        timings_ms={key: float(value) for key, value in (diagnostics.get("timings_ms") or {}).items()},
+        counters={key: int(value) for key, value in (diagnostics.get("counters") or {}).items()},
+        flags={key: bool(value) for key, value in (diagnostics.get("flags") or {}).items()},
     )
 
 
@@ -391,6 +404,54 @@ def _percentile(values: list[float], percentile: float) -> float:
     sorted_values = sorted(values)
     index = max(min(int(round((len(sorted_values) - 1) * percentile)), len(sorted_values) - 1), 0)
     return sorted_values[index]
+
+
+@contextmanager
+def benchmark_workdir(data_dir: str | None):
+    if data_dir:
+        root = Path(data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        yield tempfile.mkdtemp(prefix="cosmic-memory-bench-", dir=str(root))
+        return
+
+    with tempfile.TemporaryDirectory(prefix="cosmic-memory-bench-") as tmp:
+        yield tmp
+
+
+def _aggregate_timing_stats(samples: list[BenchmarkSample]) -> dict[str, dict[str, float]]:
+    keys = sorted({key for sample in samples for key in sample.timings_ms})
+    stats: dict[str, dict[str, float]] = {}
+    for key in keys:
+        values = [sample.timings_ms[key] for sample in samples if key in sample.timings_ms]
+        stats[key] = {
+            "mean": round(statistics.fmean(values), 3),
+            "p50": round(_percentile(values, 0.50), 3),
+            "p80": round(_percentile(values, 0.80), 3),
+            "p95": round(_percentile(values, 0.95), 3),
+        }
+    return stats
+
+
+def _aggregate_counter_stats(samples: list[BenchmarkSample]) -> dict[str, dict[str, float]]:
+    keys = sorted({key for sample in samples for key in sample.counters})
+    stats: dict[str, dict[str, float]] = {}
+    for key in keys:
+        values = [float(sample.counters[key]) for sample in samples if key in sample.counters]
+        stats[key] = {
+            "mean": round(statistics.fmean(values), 3),
+            "p50": round(_percentile(values, 0.50), 3),
+            "p95": round(_percentile(values, 0.95), 3),
+        }
+    return stats
+
+
+def _aggregate_flag_rates(samples: list[BenchmarkSample]) -> dict[str, float]:
+    keys = sorted({key for sample in samples for key in sample.flags})
+    rates: dict[str, float] = {}
+    for key in keys:
+        values = [sample.flags[key] for sample in samples if key in sample.flags]
+        rates[key] = round(sum(1 for value in values if value) / max(len(values), 1), 4)
+    return rates
 
 
 async def async_main() -> None:

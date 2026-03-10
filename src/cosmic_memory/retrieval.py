@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import re
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from time import perf_counter
 
 from cosmic_memory.domain.enums import MemoryKind, RecordStatus
 from cosmic_memory.domain.models import (
@@ -13,11 +14,12 @@ from cosmic_memory.domain.models import (
     GraphEntity,
     GraphRelation,
     MemoryRecord,
+    PassiveRecallDiagnostics,
     PassiveRecallResponse,
     RecallItem,
 )
 from cosmic_memory.graph.identity import normalize_email
-from cosmic_memory.graph.models import GraphSearchResult
+from cosmic_memory.graph.models import GraphQueryFrame, GraphSearchResult
 from cosmic_memory.graph.query import build_query_frame
 
 
@@ -26,8 +28,13 @@ class QuerySignals:
     query: str
     query_lower: str
     query_tokens: set[str]
+    query_frame: GraphQueryFrame
     normalized_emails: set[str]
     current_state_hint: bool
+    relationship_hint: bool
+    temporal_hint: bool
+    task_hint: bool
+    identity_hint: bool
 
 
 def build_query_signals(query: str) -> QuerySignals:
@@ -42,12 +49,18 @@ def build_query_signals(query: str) -> QuerySignals:
             continue
 
     query_lower = query.lower()
+    intent_values = {intent.value for intent in frame.intents}
     return QuerySignals(
         query=query,
         query_lower=query_lower,
         query_tokens=tokenize(query),
+        query_frame=frame,
         normalized_emails=normalized_emails,
         current_state_hint=any(token in query_lower for token in {"current", "currently", "now", "active"}),
+        relationship_hint="relation_lookup" in intent_values or bool(normalized_emails),
+        temporal_hint="temporal_lookup" in intent_values,
+        task_hint="task_lookup" in intent_values,
+        identity_hint=bool(normalized_emails) or "entity_lookup" in intent_values,
     )
 
 
@@ -81,8 +94,6 @@ def search_records(
             final_score = (
                 score
                 + score_tokens(query_tokens, tokenize(record.title or "")) * 0.15
-                + kind_priority_bias(record.kind)
-                + recency_bias(record.updated_at)
                 + (score_boosts or {}).get(record.memory_id, 0.0)
             )
             scored.append((record, final_score))
@@ -99,26 +110,33 @@ def build_passive_response(
     query: str,
     max_results: int,
     token_budget: int,
+    include_breakdown: bool = False,
+    diagnostics: PassiveRecallDiagnostics | None = None,
 ) -> PassiveRecallResponse:
+    rerank_started = perf_counter()
     items = [
-        RecallItem(
-            memory_id=record.memory_id,
-            kind=record.kind,
-            title=record.title,
-            content=record.content,
-            score=score,
-            tags=record.tags,
-            token_count=approx_token_count(record.content),
-        )
+        recall_item_from_record(record, score=score)
         for record, score in matches
     ]
-    items = rerank_passive_items(items, query=query)
+    items = rerank_passive_items(items, query=query, include_breakdown=include_breakdown)
+    rerank_ms = (perf_counter() - rerank_started) * 1000.0
+    select_started = perf_counter()
     selected, total_token_count = select_passive_items(
         items,
         max_results=max_results,
         token_budget=token_budget,
     )
-    return PassiveRecallResponse(items=selected, total_token_count=total_token_count)
+    select_ms = (perf_counter() - select_started) * 1000.0
+    if diagnostics is not None:
+        diagnostics.timings_ms["rerank_ms"] = round(rerank_ms, 3)
+        diagnostics.timings_ms["selection_ms"] = round(select_ms, 3)
+        diagnostics.counters["candidate_count"] = len(items)
+        diagnostics.counters["selected_count"] = len(selected)
+    return PassiveRecallResponse(
+        items=selected,
+        total_token_count=total_token_count,
+        diagnostics=diagnostics,
+    )
 
 
 def build_active_response(matches: list[tuple[MemoryRecord, float]]) -> ActiveRecallResponse:
@@ -224,6 +242,7 @@ def merge_passive_with_graph(
     max_results: int,
     token_budget: int,
     graph_bonus: float = 0.35,
+    include_breakdown: bool = False,
 ) -> PassiveRecallResponse:
     item_map: dict[str, RecallItem] = {item.memory_id: item for item in base_response.items}
     signals = build_query_signals(query)
@@ -239,8 +258,6 @@ def merge_passive_with_graph(
             tokenize(" ".join([record.title or "", record.content, " ".join(record.tags)])),
         )
         score += score_tokens(signals.query_tokens, tokenize(record.title or "")) * 0.15
-        score += kind_priority_bias(record.kind)
-        score += recency_bias(record.updated_at)
         score += graph_bonus
 
         existing = item_map.get(record.memory_id)
@@ -250,26 +267,37 @@ def merge_passive_with_graph(
             continue
 
         item_map[record.memory_id] = RecallItem(
-            memory_id=record.memory_id,
-            kind=record.kind,
-            title=record.title,
-            content=record.content,
-            score=score,
-            tags=record.tags,
-            token_count=approx_token_count(record.content),
+            **recall_item_from_record(record, score=score).model_dump()
         )
 
+    rerank_started = perf_counter()
     ranked_items = rerank_passive_items(
         list(item_map.values()),
         query=query,
         graph_memory_ids={record.memory_id for record in graph_records},
+        include_breakdown=include_breakdown,
     )
+    rerank_ms = (perf_counter() - rerank_started) * 1000.0
+    select_started = perf_counter()
     selected, total_token_count = select_passive_items(
         ranked_items,
         max_results=max_results,
         token_budget=token_budget,
     )
-    return PassiveRecallResponse(items=selected, total_token_count=total_token_count)
+    select_ms = (perf_counter() - select_started) * 1000.0
+    diagnostics = base_response.diagnostics
+    if diagnostics is not None:
+        diagnostics.counters["graph_candidate_count"] = len(graph_records)
+        diagnostics.counters["candidate_count"] = len(item_map)
+        diagnostics.counters["selected_count"] = len(selected)
+        diagnostics.flags["graph_assist_used"] = bool(graph_records)
+        diagnostics.timings_ms["graph_merge_rerank_ms"] = round(rerank_ms, 3)
+        diagnostics.timings_ms["graph_merge_selection_ms"] = round(select_ms, 3)
+    return PassiveRecallResponse(
+        items=selected,
+        total_token_count=total_token_count,
+        diagnostics=diagnostics,
+    )
 
 
 def tokenize(text: str) -> set[str]:
@@ -368,6 +396,7 @@ def rerank_passive_items(
     *,
     query: str,
     graph_memory_ids: set[str] | None = None,
+    include_breakdown: bool = False,
 ) -> list[RecallItem]:
     signals = build_query_signals(query)
     graph_memory_ids = graph_memory_ids or set()
@@ -375,11 +404,23 @@ def rerank_passive_items(
     reranked: list[RecallItem] = []
     for item in items:
         adjusted = item.model_copy(deep=True)
-        adjusted.score = adjusted.score + _passive_bonus(
+        base_score = adjusted.score
+        passive_bonus, breakdown = _passive_bonus(
             adjusted,
             signals=signals,
             graph_memory_ids=graph_memory_ids,
         )
+        adjusted.score = adjusted.score + passive_bonus
+        if include_breakdown:
+            adjusted.score_breakdown = {"base": round(base_score, 6)}
+            adjusted.score_breakdown.update(
+                {
+                    key: round(value, 6)
+                    for key, value in breakdown.items()
+                    if abs(value) > 0
+                }
+            )
+            adjusted.score_breakdown["final"] = round(adjusted.score, 6)
         reranked.append(adjusted)
 
     reranked.sort(key=lambda item: item.score, reverse=True)
@@ -421,34 +462,199 @@ def approx_token_count(text: str) -> int:
     return max(len(re.findall(r"[A-Za-z0-9_]+", text)), 1)
 
 
+def recall_item_from_record(record: MemoryRecord, *, score: float) -> RecallItem:
+    confidence = _coerce_confidence(record.metadata.get("confidence"))
+    return RecallItem(
+        memory_id=record.memory_id,
+        kind=record.kind,
+        title=record.title,
+        content=record.content,
+        score=score,
+        tags=record.tags,
+        token_count=approx_token_count(record.content),
+        source_kind=record.provenance.source_kind if record.provenance else None,
+        updated_at=record.updated_at,
+        confidence=confidence,
+        canonical_key=_coerce_str(record.metadata.get("canonical_key")),
+        always_include=_coerce_bool(record.metadata.get("always_include")),
+        supersedes=record.supersedes,
+    )
+
+
+def recall_item_from_payload(payload: dict, *, score: float, point_id=None) -> RecallItem:
+    raw_kind = payload.get("type")
+    if raw_kind is None:
+        raise KeyError(f"Missing `type` in recall payload for point {point_id}")
+    kind = MemoryKind(raw_kind)
+    return RecallItem(
+        memory_id=str(payload.get("memory_id") or point_id),
+        kind=kind,
+        title=payload.get("title"),
+        content=payload.get("content", ""),
+        score=score,
+        tags=list(payload.get("tags", [])),
+        token_count=int(payload.get("token_count") or approx_token_count(payload.get("content", ""))),
+        source_kind=_coerce_str(payload.get("source_kind")),
+        updated_at=payload.get("updated_at"),
+        confidence=_coerce_confidence(payload.get("confidence")),
+        canonical_key=_coerce_str(payload.get("canonical_key")),
+        always_include=_coerce_bool(payload.get("always_include")),
+        supersedes=_coerce_str(payload.get("supersedes")),
+    )
+
+
 def _passive_bonus(
     item: RecallItem,
     *,
     signals: QuerySignals,
     graph_memory_ids: set[str],
-) -> float:
+) -> tuple[float, dict[str, float]]:
     bonus = 0.0
+    breakdown: dict[str, float] = {}
     text_lower = " ".join([item.title or "", item.content, " ".join(item.tags)]).lower()
     if item.memory_id in graph_memory_ids:
-        bonus += 0.30
+        bonus += _record_breakdown(breakdown, "graph_support", 0.30)
     if signals.query_lower and len(signals.query_lower) >= 12 and signals.query_lower in text_lower:
-        bonus += 0.10
+        bonus += _record_breakdown(breakdown, "phrase_match", 0.10)
     if signals.current_state_hint and {"active", "current", "ongoing"} & {tag.lower() for tag in item.tags}:
-        bonus += 0.08
+        bonus += _record_breakdown(breakdown, "current_state_match", 0.08)
     if item.title:
-        bonus += score_tokens(signals.query_tokens, tokenize(item.title)) * 0.12
+        bonus += _record_breakdown(
+            breakdown,
+            "title_overlap",
+            score_tokens(signals.query_tokens, tokenize(item.title)) * 0.12,
+        )
     for email in signals.normalized_emails:
         if email in text_lower:
-            bonus += 0.70
+            bonus += _record_breakdown(breakdown, "exact_email", 0.70)
             break
+    bonus += _record_breakdown(breakdown, "kind_bias", kind_priority_bias(item.kind))
+    bonus += _record_breakdown(breakdown, "recency_bias", recency_bias(item.updated_at))
+    bonus += _record_breakdown(breakdown, "intent_kind_bias", _intent_kind_bias(item.kind, signals))
+    bonus += _record_breakdown(breakdown, "source_kind_bias", _source_kind_bias(item.source_kind))
+    bonus += _record_breakdown(
+        breakdown,
+        "confidence_bias",
+        _confidence_bias(item.confidence),
+    )
+    bonus += _record_breakdown(
+        breakdown,
+        "current_truth_bias",
+        _current_truth_bias(item, signals),
+    )
     token_count = item.token_count or approx_token_count(item.content)
     if token_count > 1400:
-        bonus -= 0.06
+        bonus += _record_breakdown(breakdown, "token_size", -0.06)
     elif token_count < 220:
-        bonus += 0.03
-    return bonus
+        bonus += _record_breakdown(breakdown, "token_size", 0.03)
+    return bonus, breakdown
 
 
 def _passive_utility_score(item: RecallItem) -> float:
     token_count = item.token_count or approx_token_count(item.content)
     return item.score / ((1.0 + (token_count / 256.0)) ** 0.5)
+
+
+def _intent_kind_bias(kind: MemoryKind, signals: QuerySignals) -> float:
+    bias = 0.0
+    if signals.identity_hint:
+        bias += {
+            MemoryKind.AGENT_NOTE: 0.06,
+            MemoryKind.USER_DATA: 0.04,
+            MemoryKind.CORE_FACT: 0.02,
+        }.get(kind, 0.0)
+    if signals.relationship_hint:
+        bias += {
+            MemoryKind.AGENT_NOTE: 0.05,
+            MemoryKind.SESSION_SUMMARY: 0.02,
+            MemoryKind.TASK_SUMMARY: 0.03,
+        }.get(kind, 0.0)
+    if signals.temporal_hint:
+        bias += {
+            MemoryKind.SESSION_SUMMARY: 0.06,
+            MemoryKind.TASK_SUMMARY: 0.04,
+            MemoryKind.CORE_FACT: 0.02,
+        }.get(kind, 0.0)
+    if signals.task_hint:
+        bias += {
+            MemoryKind.TASK_SUMMARY: 0.08,
+            MemoryKind.AGENT_NOTE: 0.04,
+            MemoryKind.SESSION_SUMMARY: 0.03,
+        }.get(kind, 0.0)
+    return min(bias, 0.16)
+
+
+def _source_kind_bias(source_kind: str | None) -> float:
+    if not source_kind:
+        return 0.0
+    normalized = source_kind.strip().lower()
+    return {
+        "gateway": 0.06,
+        "session_manager": 0.06,
+        "orchestrator": 0.05,
+        "agent": 0.03,
+        "benchmark": 0.0,
+        "test": 0.0,
+    }.get(normalized, 0.0)
+
+
+def _confidence_bias(confidence: float | None) -> float:
+    if confidence is None:
+        return 0.0
+    bounded = max(0.0, min(confidence, 1.0))
+    return (bounded - 0.5) * 0.12
+
+
+def _current_truth_bias(item: RecallItem, signals: QuerySignals) -> float:
+    bias = 0.0
+    if item.kind is MemoryKind.CORE_FACT:
+        bias += 0.06
+    if item.always_include:
+        bias += 0.04
+    if item.canonical_key:
+        bias += 0.03
+    if item.supersedes:
+        bias += 0.04
+    if not signals.current_state_hint and {"active", "current", "ongoing"} & {
+        tag.lower() for tag in item.tags
+    }:
+        bias += 0.02
+    return bias
+
+
+def _record_breakdown(breakdown: dict[str, float], key: str, value: float) -> float:
+    if value == 0:
+        return 0.0
+    breakdown[key] = breakdown.get(key, 0.0) + value
+    return value
+
+
+def _coerce_confidence(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_str(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _coerce_bool(value) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)

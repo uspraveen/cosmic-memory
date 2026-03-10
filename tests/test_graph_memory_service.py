@@ -133,11 +133,16 @@ def test_passive_recall_can_be_boosted_by_graph_supporting_memory():
                 query="What project is nxagarwal@ualr.edu working on?",
                 max_results=4,
                 token_budget=80,
+                include_diagnostics=True,
             )
         )
 
         assert result.items
         assert result.items[0].memory_id == record.memory_id
+        assert result.diagnostics is not None
+        assert result.diagnostics.flags["graph_assist_requested"] is True
+        assert result.diagnostics.flags["graph_assist_used"] is True
+        assert result.diagnostics.timings_ms["graph_wait_ms"] >= 0
 
     asyncio.run(run())
 

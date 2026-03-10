@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from time import perf_counter
 
 from cosmic_memory.core_facts import build_core_fact_block, find_active_core_fact_by_key
 from cosmic_memory.domain.enums import RecordStatus
@@ -14,6 +15,7 @@ from cosmic_memory.domain.models import (
     IndexStatusResponse,
     IndexSyncResponse,
     MemoryRecord,
+    PassiveRecallDiagnostics,
     PassiveRecallRequest,
     PassiveRecallResponse,
     SupersedeMemoryRequest,
@@ -89,12 +91,25 @@ class InMemoryDevelopmentMemoryService:
         )
 
     async def passive_recall(self, request: PassiveRecallRequest) -> PassiveRecallResponse:
-        base_task = asyncio.create_task(asyncio.to_thread(self._build_base_passive_response, request))
+        service_started = perf_counter()
+        diagnostics = PassiveRecallDiagnostics() if request.include_diagnostics else None
+        if diagnostics is not None:
+            diagnostics.flags["graph_assist_requested"] = False
+            diagnostics.flags["graph_assist_used"] = False
+            diagnostics.flags["index_used"] = False
+            diagnostics.flags["index_fallback_used"] = False
+
+        base_started = perf_counter()
+        base_task = asyncio.create_task(
+            asyncio.to_thread(self._build_base_passive_response, request, diagnostics)
+        )
         query_frame = None
         graph_task = None
         if self.graph_store is not None:
             query_frame = build_query_frame(request.query)
             if self._should_run_passive_graph_assist(query_frame):
+                if diagnostics is not None:
+                    diagnostics.flags["graph_assist_requested"] = True
                 graph_task = asyncio.create_task(
                     self.graph_store.passive_search(
                         query_frame,
@@ -104,9 +119,22 @@ class InMemoryDevelopmentMemoryService:
                 )
 
         response = await base_task
+        diagnostics = response.diagnostics or diagnostics
+        if diagnostics is not None:
+            diagnostics.flags["graph_assist_requested"] = graph_task is not None
+            diagnostics.flags.setdefault("graph_assist_used", False)
+            diagnostics.timings_ms["service_base_recall_ms"] = round(
+                (perf_counter() - base_started) * 1000.0,
+                3,
+            )
         if graph_task is None:
-            return response
+            return self._finalize_passive_response(
+                response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
 
+        graph_wait_started = perf_counter()
         try:
             graph_result = await asyncio.wait_for(
                 asyncio.shield(graph_task),
@@ -114,24 +142,76 @@ class InMemoryDevelopmentMemoryService:
             )
         except asyncio.TimeoutError:
             graph_task.cancel()
-            return response
+            if diagnostics is not None:
+                diagnostics.flags["graph_assist_timed_out"] = True
+                diagnostics.notes.append("Passive graph assist timed out.")
+                diagnostics.timings_ms["graph_wait_ms"] = round(
+                    (perf_counter() - graph_wait_started) * 1000.0,
+                    3,
+                )
+            return self._finalize_passive_response(
+                response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
         except Exception:
-            return response
+            if diagnostics is not None:
+                diagnostics.notes.append("Passive graph assist failed.")
+                diagnostics.timings_ms["graph_wait_ms"] = round(
+                    (perf_counter() - graph_wait_started) * 1000.0,
+                    3,
+                )
+            return self._finalize_passive_response(
+                response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
 
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_wait_ms"] = round(
+                (perf_counter() - graph_wait_started) * 1000.0,
+                3,
+            )
+
+        graph_load_started = perf_counter()
         graph_records = [
             self._records[memory_id]
             for memory_id in graph_result.supporting_memory_ids
             if memory_id in self._records and self._records[memory_id].status == RecordStatus.ACTIVE
         ]
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_load_records_ms"] = round(
+                (perf_counter() - graph_load_started) * 1000.0,
+                3,
+            )
         if not graph_records:
-            return response
-        return merge_passive_with_graph(
+            if diagnostics is not None:
+                diagnostics.notes.append("Graph assist returned no active canonical records.")
+            return self._finalize_passive_response(
+                response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
+        merge_started = perf_counter()
+        response = merge_passive_with_graph(
             base_response=response,
             graph_records=graph_records,
             query=request.query,
             kinds=request.kinds,
             max_results=request.max_results,
             token_budget=request.token_budget,
+            include_breakdown=request.include_diagnostics,
+        )
+        diagnostics = response.diagnostics or diagnostics
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_merge_ms"] = round(
+                (perf_counter() - merge_started) * 1000.0,
+                3,
+            )
+        return self._finalize_passive_response(
+            response,
+            diagnostics=diagnostics,
+            started_at=service_started,
         )
 
     async def active_recall(self, request: ActiveRecallRequest) -> ActiveRecallResponse:
@@ -218,18 +298,32 @@ class InMemoryDevelopmentMemoryService:
             return
         await self.graph_store.ingest_document(document)
 
-    def _build_base_passive_response(self, request: PassiveRecallRequest) -> PassiveRecallResponse:
+    def _build_base_passive_response(
+        self,
+        request: PassiveRecallRequest,
+        diagnostics: PassiveRecallDiagnostics | None = None,
+    ) -> PassiveRecallResponse:
+        candidate_limit = passive_candidate_limit(request.max_results)
+        search_started = perf_counter()
         matches = search_records(
             self._records.values(),
             request.query,
             request.kinds,
-            limit=passive_candidate_limit(request.max_results),
+            limit=candidate_limit,
         )
+        if diagnostics is not None:
+            diagnostics.timings_ms["lexical_search_ms"] = round(
+                (perf_counter() - search_started) * 1000.0,
+                3,
+            )
+            diagnostics.counters["candidate_limit"] = candidate_limit
         return build_passive_response(
             matches,
             query=request.query,
             max_results=request.max_results,
             token_budget=request.token_budget,
+            include_breakdown=request.include_diagnostics,
+            diagnostics=diagnostics,
         )
 
     @staticmethod
@@ -237,3 +331,21 @@ class InMemoryDevelopmentMemoryService:
         return bool(query_frame.identity_candidates) or query_frame.prefer_current_state or any(
             intent.value != "generic" for intent in query_frame.intents
         )
+
+    @staticmethod
+    def _finalize_passive_response(
+        response: PassiveRecallResponse,
+        *,
+        diagnostics: PassiveRecallDiagnostics | None,
+        started_at: float,
+    ) -> PassiveRecallResponse:
+        if diagnostics is None:
+            return response
+
+        diagnostics.timings_ms["service_total_ms"] = round(
+            (perf_counter() - started_at) * 1000.0,
+            3,
+        )
+        if response.diagnostics is diagnostics:
+            return response
+        return response.model_copy(update={"diagnostics": diagnostics})

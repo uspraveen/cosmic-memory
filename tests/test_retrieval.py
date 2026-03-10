@@ -72,3 +72,44 @@ def test_rerank_passive_items_boosts_exact_email_hits():
     )
 
     assert [item.memory_id for item in reranked][:2] == ["mem_email", "mem_alias"]
+
+
+def test_rerank_passive_items_emits_score_breakdown_and_biases_current_core_facts():
+    items = [
+        RecallItem(
+            memory_id="mem_user",
+            kind=MemoryKind.USER_DATA,
+            title="Imported preference",
+            content="User prefers concise answers.",
+            score=0.9,
+            tags=["imported"],
+            token_count=4,
+            source_kind="test",
+            confidence=0.5,
+        ),
+        RecallItem(
+            memory_id="mem_core",
+            kind=MemoryKind.CORE_FACT,
+            title="Current answer preference",
+            content="User prefers concise answers.",
+            score=0.9,
+            tags=["current", "active"],
+            token_count=4,
+            source_kind="gateway",
+            confidence=0.95,
+            canonical_key="response_style",
+            always_include=True,
+        ),
+    ]
+
+    reranked = rerank_passive_items(
+        items,
+        query="What are the user's current concise answer preferences?",
+        include_breakdown=True,
+    )
+
+    assert [item.memory_id for item in reranked][:2] == ["mem_core", "mem_user"]
+    assert reranked[0].score_breakdown is not None
+    assert reranked[0].score_breakdown["kind_bias"] > 0
+    assert reranked[0].score_breakdown["current_truth_bias"] > 0
+    assert reranked[0].score_breakdown["source_kind_bias"] > 0

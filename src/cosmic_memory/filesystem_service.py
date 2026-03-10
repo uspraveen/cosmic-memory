@@ -19,6 +19,7 @@ from cosmic_memory.domain.models import (
     IndexStatusResponse,
     IndexSyncResponse,
     MemoryRecord,
+    PassiveRecallDiagnostics,
     PassiveRecallRequest,
     PassiveRecallResponse,
     SupersedeMemoryRequest,
@@ -118,14 +119,23 @@ class FilesystemMemoryService:
         )
 
     async def passive_recall(self, request: PassiveRecallRequest) -> PassiveRecallResponse:
-        base_task = asyncio.create_task(self._base_passive_recall(request))
+        service_started = perf_counter()
+        diagnostics = PassiveRecallDiagnostics() if request.include_diagnostics else None
+        if diagnostics is not None:
+            diagnostics.flags["graph_assist_requested"] = False
+            diagnostics.flags["graph_assist_used"] = False
+            diagnostics.flags["index_fallback_used"] = False
+
+        base_started = perf_counter()
+        base_task = asyncio.create_task(self._base_passive_recall(request, diagnostics=diagnostics))
         query_frame = None
         graph_task = None
-        started_at = perf_counter()
 
         if self.graph_store is not None:
             query_frame = build_query_frame(request.query)
             if self._should_run_passive_graph_assist(query_frame):
+                if diagnostics is not None:
+                    diagnostics.flags["graph_assist_requested"] = True
                 graph_task = asyncio.create_task(
                     self.graph_store.passive_search(
                         query_frame,
@@ -135,26 +145,75 @@ class FilesystemMemoryService:
                 )
 
         base_response = await base_task
+        diagnostics = base_response.diagnostics or diagnostics
+        if diagnostics is not None:
+            diagnostics.flags["graph_assist_requested"] = graph_task is not None
+            diagnostics.flags.setdefault("graph_assist_used", False)
+            diagnostics.timings_ms["service_base_recall_ms"] = round(
+                (perf_counter() - base_started) * 1000.0,
+                3,
+            )
         if graph_task is None:
-            return base_response
+            return self._finalize_passive_response(
+                base_response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
 
+        graph_wait_started = perf_counter()
         graph_result = await self._await_graph_result(
             graph_task,
-            started_at=started_at,
+            started_at=service_started,
+            diagnostics=diagnostics,
         )
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_wait_ms"] = round(
+                (perf_counter() - graph_wait_started) * 1000.0,
+                3,
+            )
         if graph_result is None or not graph_result.supporting_memory_ids:
-            return base_response
+            return self._finalize_passive_response(
+                base_response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
 
+        graph_load_started = perf_counter()
         graph_records = self._load_records_by_ids(graph_result.supporting_memory_ids)
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_load_records_ms"] = round(
+                (perf_counter() - graph_load_started) * 1000.0,
+                3,
+            )
         if not graph_records:
-            return base_response
-        return merge_passive_with_graph(
+            if diagnostics is not None:
+                diagnostics.notes.append("Graph assist returned no active canonical records.")
+            return self._finalize_passive_response(
+                base_response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
+
+        merge_started = perf_counter()
+        response = merge_passive_with_graph(
             base_response=base_response,
             graph_records=graph_records,
             query=request.query,
             kinds=request.kinds,
             max_results=request.max_results,
             token_budget=request.token_budget,
+            include_breakdown=request.include_diagnostics,
+        )
+        diagnostics = response.diagnostics or diagnostics
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_merge_ms"] = round(
+                (perf_counter() - merge_started) * 1000.0,
+                3,
+            )
+        return self._finalize_passive_response(
+            response,
+            diagnostics=diagnostics,
+            started_at=service_started,
         )
 
     async def active_recall(self, request: ActiveRecallRequest) -> ActiveRecallResponse:
@@ -410,44 +469,79 @@ class FilesystemMemoryService:
     def _collection_name(self) -> str | None:
         return getattr(self.passive_index, "collection_name", None)
 
-    async def _base_passive_recall(self, request: PassiveRecallRequest) -> PassiveRecallResponse:
+    async def _base_passive_recall(
+        self,
+        request: PassiveRecallRequest,
+        *,
+        diagnostics: PassiveRecallDiagnostics | None = None,
+    ) -> PassiveRecallResponse:
         if self.passive_index is not None:
             try:
                 await self.passive_index.ensure_ready()
                 return await self.passive_index.search(request)
             except Exception:
                 logger.exception("Passive index search failed, falling back to lexical recall.")
+                if diagnostics is not None:
+                    diagnostics.flags["index_fallback_used"] = True
+                    diagnostics.notes.append(
+                        "Passive index search failed; fell back to lexical recall."
+                    )
 
+        search_started = perf_counter()
         records = self._load_records(status=RecordStatus.ACTIVE, kinds=request.kinds)
+        candidate_limit = passive_candidate_limit(request.max_results)
         matches = search_records(
             records,
             request.query,
             request.kinds,
-            limit=passive_candidate_limit(request.max_results),
+            limit=candidate_limit,
         )
+        if diagnostics is not None:
+            diagnostics.timings_ms["lexical_search_ms"] = round(
+                (perf_counter() - search_started) * 1000.0,
+                3,
+            )
+            diagnostics.counters["candidate_limit"] = candidate_limit
+            diagnostics.flags.setdefault("index_used", False)
         return build_passive_response(
             matches,
             query=request.query,
             max_results=request.max_results,
             token_budget=request.token_budget,
+            include_breakdown=request.include_diagnostics,
+            diagnostics=diagnostics,
         )
 
-    async def _await_graph_result(self, task: asyncio.Task, *, started_at: float):
+    async def _await_graph_result(
+        self,
+        task: asyncio.Task,
+        *,
+        started_at: float,
+        diagnostics: PassiveRecallDiagnostics | None = None,
+    ):
         if task.done():
             return self._task_result_or_none(task)
 
         remaining = self.passive_graph_timeout_seconds - (perf_counter() - started_at)
         if remaining <= 0:
             task.cancel()
+            if diagnostics is not None:
+                diagnostics.flags["graph_assist_timed_out"] = True
+                diagnostics.notes.append("Passive graph assist skipped because no timeout budget remained.")
             return None
 
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.TimeoutError:
             task.cancel()
+            if diagnostics is not None:
+                diagnostics.flags["graph_assist_timed_out"] = True
+                diagnostics.notes.append("Passive graph assist timed out.")
             return None
         except Exception:
             logger.exception("Passive graph assist failed.")
+            if diagnostics is not None:
+                diagnostics.notes.append("Passive graph assist failed.")
             return None
 
     @staticmethod
@@ -476,3 +570,21 @@ class FilesystemMemoryService:
         if document is None:
             return
         await self.graph_store.ingest_document(document)
+
+    @staticmethod
+    def _finalize_passive_response(
+        response: PassiveRecallResponse,
+        *,
+        diagnostics: PassiveRecallDiagnostics | None,
+        started_at: float,
+    ) -> PassiveRecallResponse:
+        if diagnostics is None:
+            return response
+
+        diagnostics.timings_ms["service_total_ms"] = round(
+            (perf_counter() - started_at) * 1000.0,
+            3,
+        )
+        if response.diagnostics is diagnostics:
+            return response
+        return response.model_copy(update={"diagnostics": diagnostics})
