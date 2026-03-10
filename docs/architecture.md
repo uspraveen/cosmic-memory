@@ -149,6 +149,8 @@ isolated from storage:
 - Qdrant sync/search calls the same embedding service instead of generating
   vectors inline,
 - native BM25 text conversion happens inside Qdrant by default,
+- the app's `auto` sparse mode uses FastEmbed for local-path Qdrant and keeps
+  native BM25 for remote Qdrant,
 - local-path Qdrant still requires `fastembed` in the client environment for
   native document/sparse inference,
 - explicit sparse encoders remain available as a fallback for tests and older clients.

@@ -1,7 +1,11 @@
 import pytest
 
 from cosmic_memory.embeddings.hash import HashEmbeddingService
-from cosmic_memory.server.app import _build_embedding_service_from_env, _build_graph_store_from_env
+from cosmic_memory.server.app import (
+    _build_embedding_service_from_env,
+    _build_graph_store_from_env,
+    _build_passive_index_from_env,
+)
 
 
 def test_build_embedding_service_requires_api_key_in_production(monkeypatch: pytest.MonkeyPatch):
@@ -56,3 +60,42 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
         "password": "secret",
         "database": "neo4j",
     }
+
+
+def test_build_passive_index_prefers_fastembed_for_local_qdrant(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeFastEmbedSparseEncoder:
+        def __init__(self, model_name: str = "Qdrant/bm25") -> None:
+            self.model_name = model_name
+
+    class FakeIndex:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.delenv("COSMIC_MEMORY_QDRANT_URL", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_QDRANT_PATH", "/tmp/qdrant")
+    monkeypatch.delenv("COSMIC_MEMORY_SPARSE_BACKEND", raising=False)
+    monkeypatch.setattr("cosmic_memory.server.app.FastEmbedSparseEncoder", FakeFastEmbedSparseEncoder)
+    monkeypatch.setattr("cosmic_memory.server.app.QdrantHybridMemoryIndex", FakeIndex)
+
+    _build_passive_index_from_env(HashEmbeddingService(dimensions=32))
+
+    assert isinstance(captured["sparse_encoder"], FakeFastEmbedSparseEncoder)
+
+
+def test_build_passive_index_can_force_native_sparse_backend(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeIndex:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.delenv("COSMIC_MEMORY_QDRANT_URL", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_QDRANT_PATH", "/tmp/qdrant")
+    monkeypatch.setenv("COSMIC_MEMORY_SPARSE_BACKEND", "native")
+    monkeypatch.setattr("cosmic_memory.server.app.QdrantHybridMemoryIndex", FakeIndex)
+
+    _build_passive_index_from_env(HashEmbeddingService(dimensions=32))
+
+    assert captured["sparse_encoder"] is None

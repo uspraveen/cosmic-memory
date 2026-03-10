@@ -21,7 +21,7 @@ from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.env import load_env_file
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
-from cosmic_memory.index import QdrantHybridMemoryIndex
+from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
 from cosmic_memory.service import MemoryService
 
 
@@ -198,10 +198,26 @@ def _build_passive_index_from_env(
         or os.environ.get("QDRANT_PATH")
         or default_path
     )
+    sparse_backend = os.environ.get("COSMIC_MEMORY_SPARSE_BACKEND", "auto").strip().lower()
+    sparse_model_name = os.environ.get("COSMIC_MEMORY_SPARSE_MODEL", "Qdrant/bm25")
+
+    sparse_encoder = None
+    if sparse_backend == "simple":
+        sparse_encoder = SimpleSparseEncoder()
+    elif sparse_backend == "fastembed":
+        sparse_encoder = FastEmbedSparseEncoder(model_name=sparse_model_name)
+    elif sparse_backend in {"", "auto"} and qdrant_path and not qdrant_url:
+        sparse_encoder = FastEmbedSparseEncoder(model_name=sparse_model_name)
+    elif sparse_backend not in {"", "auto", "native"}:
+        raise RuntimeError(
+            "Unsupported COSMIC_MEMORY_SPARSE_BACKEND value. "
+            "Supported values are `auto`, `native`, `fastembed`, and `simple`."
+        )
 
     return QdrantHybridMemoryIndex(
         embedding_service=embedding_service,
-        sparse_model_name=os.environ.get("COSMIC_MEMORY_SPARSE_MODEL", "Qdrant/bm25"),
+        sparse_encoder=sparse_encoder,
+        sparse_model_name=sparse_model_name,
         collection_name=os.environ.get("COSMIC_MEMORY_QDRANT_COLLECTION", "memories"),
         vector_size=int(os.environ.get("COSMIC_MEMORY_VECTOR_SIZE", str(embedding_service.dimensions))),
         url=qdrant_url,

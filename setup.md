@@ -60,6 +60,7 @@ COSMIC_MEMORY_EMBED_ENCODING=base64_int8
 COSMIC_MEMORY_QDRANT_COLLECTION=memories
 COSMIC_MEMORY_QDRANT_PATH=.cosmic-memory-data/qdrant_data
 COSMIC_MEMORY_SPARSE_MODEL=Qdrant/bm25
+COSMIC_MEMORY_SPARSE_BACKEND=auto
 COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS=120
 COSMIC_MEMORY_SYNC_ON_STARTUP=true
 ```
@@ -85,6 +86,7 @@ COSMIC_MEMORY_NEO4J_DATABASE=neo4j
 ## Qdrant Notes
 
 - Production defaults to Qdrant-native BM25 for sparse retrieval.
+- `COSMIC_MEMORY_SPARSE_BACKEND=auto` uses FastEmbed sparse encoding for local-path Qdrant and keeps native BM25 for remote Qdrant.
 - This requires `qdrant-client>=1.15.2`.
 - If you use `COSMIC_MEMORY_QDRANT_PATH` with native BM25, install `fastembed` too.
 - Dense embeddings still come from Perplexity.

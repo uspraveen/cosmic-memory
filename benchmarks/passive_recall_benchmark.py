@@ -30,7 +30,7 @@ from cosmic_memory.index.qdrant import (
     _has_fastembed,
     _supports_qdrant_native_bm25,
 )
-from cosmic_memory.index.sparse import SimpleSparseEncoder
+from cosmic_memory.index.sparse import FastEmbedSparseEncoder, SimpleSparseEncoder
 
 
 @dataclass(slots=True)
@@ -242,7 +242,14 @@ async def seed_http_service(client: httpx.AsyncClient, total_records: int) -> No
 async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
     graph_store = InMemoryGraphStore() if args.graph_backend == "memory" else None
     with tempfile.TemporaryDirectory(prefix="cosmic-memory-bench-", dir=args.data_dir) as tmp:
-        if _supports_qdrant_native_bm25() and _has_fastembed():
+        if _has_fastembed():
+            index = QdrantHybridMemoryIndex(
+                embedding_service=HashEmbeddingService(dimensions=256),
+                sparse_encoder=FastEmbedSparseEncoder(),
+                path=str(Path(tmp) / "qdrant"),
+                vector_size=256,
+            )
+        elif _supports_qdrant_native_bm25():
             index = QdrantHybridMemoryIndex(
                 embedding_service=HashEmbeddingService(dimensions=256),
                 path=str(Path(tmp) / "qdrant"),

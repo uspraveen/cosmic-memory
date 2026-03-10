@@ -104,6 +104,7 @@ Relevant environment variables:
 - `COSMIC_MEMORY_QDRANT_URL` or `COSMIC_MEMORY_QDRANT_PATH`
 - `COSMIC_MEMORY_QDRANT_COLLECTION` (default `memories`)
 - `COSMIC_MEMORY_SPARSE_MODEL` (default `Qdrant/bm25`)
+- `COSMIC_MEMORY_SPARSE_BACKEND` (`auto`, `native`, `fastembed`, or `simple`; default `auto`)
 - `COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS` (default `120`)
 - `COSMIC_MEMORY_SYNC_ON_STARTUP` or `MEMORY_SYNC_ON_STARTUP` (default `true`)
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)
@@ -117,6 +118,7 @@ Passive retrieval notes:
 
 - dense vectors come from Perplexity embeddings,
 - sparse retrieval defaults to Qdrant-native BM25,
+- `COSMIC_MEMORY_SPARSE_BACKEND=auto` uses FastEmbed sparse encoding for local-path Qdrant and keeps native BM25 for remote/server Qdrant,
 - `qdrant-client>=1.15.2` is required for the native BM25 path,
 - local-path Qdrant with native BM25 also requires `fastembed` in the client environment,
 - explicit sparse encoders are still supported for tests and older environments.
