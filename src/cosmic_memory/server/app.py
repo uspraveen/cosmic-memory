@@ -1,0 +1,249 @@
+"""FastAPI server for cosmic-memory."""
+
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request, status
+
+from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
+from cosmic_memory.domain.models import (
+    ActiveRecallRequest,
+    GenerateEmbeddingsRequest,
+    PassiveRecallRequest,
+    SupersedeMemoryRequest,
+    WriteCoreFactRequest,
+    WriteMemoryRequest,
+)
+from cosmic_memory.embeddings import HashEmbeddingService, PerplexityStandardEmbeddingService
+from cosmic_memory.embeddings.base import EmbeddingService
+from cosmic_memory.env import load_env_file
+from cosmic_memory.filesystem_service import FilesystemMemoryService
+from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
+from cosmic_memory.index import QdrantHybridMemoryIndex
+from cosmic_memory.service import MemoryService
+
+
+def create_app(
+    service: MemoryService,
+    *,
+    embedding_service: EmbeddingService,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if _sync_on_startup_enabled():
+            sync_index = getattr(app.state.memory_service, "sync_index", None)
+            if sync_index is not None:
+                await sync_index()
+        yield
+        await _close_if_present(getattr(app.state, "embedding_service", None))
+        passive_index = getattr(getattr(app.state, "memory_service", None), "passive_index", None)
+        await _close_if_present(passive_index)
+        graph_store = getattr(getattr(app.state, "memory_service", None), "graph_store", None)
+        await _close_if_present(graph_store)
+
+    app = FastAPI(title="cosmic-memory", version="0.1.0", lifespan=lifespan)
+    app.state.memory_service = service
+    app.state.embedding_service = embedding_service
+
+    @app.get("/health")
+    async def health(request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.health()
+
+    @app.post("/v1/embeddings/generate")
+    async def generate_embeddings(payload: GenerateEmbeddingsRequest, request: Request):
+        embedder: EmbeddingService = request.app.state.embedding_service
+        return await embedder.generate(payload)
+
+    @app.post("/v1/memories", status_code=status.HTTP_201_CREATED)
+    async def write_memory(payload: WriteMemoryRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.write(payload)
+
+    @app.post("/v1/core-facts", status_code=status.HTTP_201_CREATED)
+    async def write_core_fact(payload: WriteCoreFactRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.write_core_fact(payload)
+
+    @app.get("/v1/core-facts")
+    async def get_core_fact_block(
+        request: Request,
+        limit: int | None = None,
+        max_chars: int = 1500,
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.build_core_fact_block(limit=limit, max_chars=max_chars)
+
+    @app.get("/v1/memories/{memory_id}")
+    async def get_memory(memory_id: str, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        record = await svc.get(memory_id)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
+        return record
+
+    @app.post("/v1/query/passive")
+    async def passive_recall(payload: PassiveRecallRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.passive_recall(payload)
+
+    @app.post("/v1/query/active")
+    async def active_recall(payload: ActiveRecallRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.active_recall(payload)
+
+    @app.get("/v1/index/status")
+    async def get_index_status(request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_index_status()
+
+    @app.post("/v1/index/sync")
+    async def sync_index(request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.sync_index()
+
+    @app.post("/v1/index/rebuild")
+    async def rebuild_index(request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.rebuild_index()
+
+    @app.post("/v1/memories/{memory_id}/supersede")
+    async def supersede_memory(memory_id: str, payload: SupersedeMemoryRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        record = await svc.supersede(memory_id, payload)
+        if record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
+        return record
+
+    return app
+
+
+def create_default_app() -> FastAPI:
+    return create_filesystem_app()
+
+
+def create_development_app() -> FastAPI:
+    return create_app(
+        InMemoryDevelopmentMemoryService(graph_store=InMemoryGraphStore()),
+        embedding_service=HashEmbeddingService(),
+    )
+
+
+def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
+    load_env_file()
+    data_root = root_dir or os.environ.get("COSMIC_MEMORY_DATA_DIR", ".cosmic-memory-data")
+    embedding_service = _build_embedding_service_from_env(require_remote=True)
+    passive_index = _build_passive_index_from_env(
+        embedding_service,
+        default_path=str(Path(data_root) / "qdrant_data"),
+    )
+    graph_store = _build_graph_store_from_env()
+    return create_app(
+        FilesystemMemoryService(
+            data_root,
+            passive_index=passive_index,
+            graph_store=graph_store,
+            passive_graph_timeout_seconds=float(
+                os.environ.get("COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS", "120")
+            )
+            / 1000.0,
+        ),
+        embedding_service=embedding_service,
+    )
+
+
+async def _close_if_present(resource) -> None:
+    close = getattr(resource, "close", None)
+    if close is None:
+        return
+    await close()
+
+
+def _build_embedding_service_from_env(*, require_remote: bool = True) -> EmbeddingService:
+    dimensions = int(os.environ.get("COSMIC_MEMORY_EMBEDDING_DIMENSIONS", "1024"))
+    model_name = os.environ.get("COSMIC_MEMORY_EMBEDDING_MODEL", "pplx-embed-v1-4b")
+    batch_size = int(os.environ.get("COSMIC_MEMORY_EMBED_BATCH_SIZE", "128"))
+    max_parallel_requests = int(os.environ.get("COSMIC_MEMORY_EMBED_MAX_PARALLEL", "4"))
+    encoding_format = os.environ.get("COSMIC_MEMORY_EMBED_ENCODING", "base64_int8")
+    normalize = os.environ.get("COSMIC_MEMORY_EMBED_NORMALIZE", "true").lower() != "false"
+    api_key = os.environ.get("PERPLEXITY_API_KEY") or os.environ.get("PPLX_API_KEY")
+    if not api_key:
+        if not require_remote:
+            return HashEmbeddingService(dimensions=dimensions)
+        raise RuntimeError(
+            "PERPLEXITY_API_KEY is required for production app factories. "
+            "Use create_development_app() for local deterministic testing."
+        )
+    return PerplexityStandardEmbeddingService(
+        api_key=api_key,
+        model_name=model_name,
+        dimensions=dimensions,
+        batch_size=batch_size,
+        max_parallel_requests=max_parallel_requests,
+        encoding_format=encoding_format,
+        normalize=normalize,
+    )
+
+
+def _build_passive_index_from_env(
+    embedding_service: EmbeddingService,
+    *,
+    default_path: str | None = None,
+):
+    qdrant_url = os.environ.get("COSMIC_MEMORY_QDRANT_URL")
+    qdrant_path = (
+        os.environ.get("COSMIC_MEMORY_QDRANT_PATH")
+        or os.environ.get("QDRANT_PATH")
+        or default_path
+    )
+
+    return QdrantHybridMemoryIndex(
+        embedding_service=embedding_service,
+        sparse_model_name=os.environ.get("COSMIC_MEMORY_SPARSE_MODEL", "Qdrant/bm25"),
+        collection_name=os.environ.get("COSMIC_MEMORY_QDRANT_COLLECTION", "memories"),
+        vector_size=int(os.environ.get("COSMIC_MEMORY_VECTOR_SIZE", str(embedding_service.dimensions))),
+        url=qdrant_url,
+        path=qdrant_path,
+        embed_batch_size=int(os.environ.get("COSMIC_MEMORY_EMBED_BATCH_SIZE", "128")),
+        embed_parallel_requests=int(os.environ.get("COSMIC_MEMORY_EMBED_MAX_PARALLEL", "4")),
+        dense_encoding_format=os.environ.get("COSMIC_MEMORY_EMBED_ENCODING", "base64_int8"),
+    )
+
+
+def _sync_on_startup_enabled() -> bool:
+    raw = os.environ.get("COSMIC_MEMORY_SYNC_ON_STARTUP") or os.environ.get(
+        "MEMORY_SYNC_ON_STARTUP",
+        "true",
+    )
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _build_graph_store_from_env():
+    backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
+    if backend in {"", "none", "off"}:
+        return None
+    if backend == "memory":
+        return InMemoryGraphStore()
+    if backend == "neo4j":
+        uri = os.environ.get("COSMIC_MEMORY_NEO4J_URI")
+        username = os.environ.get("COSMIC_MEMORY_NEO4J_USERNAME")
+        password = os.environ.get("COSMIC_MEMORY_NEO4J_PASSWORD")
+        database = os.environ.get("COSMIC_MEMORY_NEO4J_DATABASE", "neo4j")
+        if not uri or not username or not password:
+            raise RuntimeError(
+                "COSMIC_MEMORY_NEO4J_URI, COSMIC_MEMORY_NEO4J_USERNAME, and "
+                "COSMIC_MEMORY_NEO4J_PASSWORD are required when "
+                "COSMIC_MEMORY_GRAPH_BACKEND=neo4j."
+            )
+        return Neo4jGraphStore(
+            uri=uri,
+            username=username,
+            password=password,
+            database=database,
+        )
+    raise RuntimeError(
+        f"Unsupported graph backend: {backend}. "
+        "Supported values are `none`, `memory`, and `neo4j`."
+    )

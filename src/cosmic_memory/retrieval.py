@@ -1,0 +1,454 @@
+"""Shared retrieval helpers for memory services."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+from collections.abc import Iterable
+from datetime import datetime, timezone
+
+from cosmic_memory.domain.enums import MemoryKind, RecordStatus
+from cosmic_memory.domain.models import (
+    ActiveRecallResponse,
+    GraphEntity,
+    GraphRelation,
+    MemoryRecord,
+    PassiveRecallResponse,
+    RecallItem,
+)
+from cosmic_memory.graph.identity import normalize_email
+from cosmic_memory.graph.models import GraphSearchResult
+from cosmic_memory.graph.query import build_query_frame
+
+
+@dataclass(slots=True)
+class QuerySignals:
+    query: str
+    query_lower: str
+    query_tokens: set[str]
+    normalized_emails: set[str]
+    current_state_hint: bool
+
+
+def build_query_signals(query: str) -> QuerySignals:
+    frame = build_query_frame(query)
+    normalized_emails: set[str] = set()
+    for candidate in frame.identity_candidates:
+        if candidate.key_type.value != "email":
+            continue
+        try:
+            normalized_emails.add(normalize_email(candidate.raw_value))
+        except ValueError:
+            continue
+
+    query_lower = query.lower()
+    return QuerySignals(
+        query=query,
+        query_lower=query_lower,
+        query_tokens=tokenize(query),
+        normalized_emails=normalized_emails,
+        current_state_hint=any(token in query_lower for token in {"current", "currently", "now", "active"}),
+    )
+
+
+def search_records(
+    records: Iterable[MemoryRecord],
+    query: str,
+    kinds,
+    limit: int | None = None,
+    score_boosts: dict[str, float] | None = None,
+) -> list[tuple[MemoryRecord, float]]:
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return []
+
+    scored: list[tuple[MemoryRecord, float]] = []
+    for record in records:
+        if record.status is not RecordStatus.ACTIVE:
+            continue
+        if kinds and record.kind not in kinds:
+            continue
+
+        haystack = " ".join(
+            [
+                record.title or "",
+                record.content,
+                " ".join(record.tags),
+            ]
+        )
+        score = score_tokens(query_tokens, tokenize(haystack))
+        if score > 0:
+            final_score = (
+                score
+                + score_tokens(query_tokens, tokenize(record.title or "")) * 0.15
+                + kind_priority_bias(record.kind)
+                + recency_bias(record.updated_at)
+                + (score_boosts or {}).get(record.memory_id, 0.0)
+            )
+            scored.append((record, final_score))
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    if limit is not None:
+        return scored[:limit]
+    return scored
+
+
+def build_passive_response(
+    matches: list[tuple[MemoryRecord, float]],
+    *,
+    query: str,
+    max_results: int,
+    token_budget: int,
+) -> PassiveRecallResponse:
+    items = [
+        RecallItem(
+            memory_id=record.memory_id,
+            kind=record.kind,
+            title=record.title,
+            content=record.content,
+            score=score,
+            tags=record.tags,
+            token_count=approx_token_count(record.content),
+        )
+        for record, score in matches
+    ]
+    items = rerank_passive_items(items, query=query)
+    selected, total_token_count = select_passive_items(
+        items,
+        max_results=max_results,
+        token_budget=token_budget,
+    )
+    return PassiveRecallResponse(items=selected, total_token_count=total_token_count)
+
+
+def build_active_response(matches: list[tuple[MemoryRecord, float]]) -> ActiveRecallResponse:
+    items = [
+        RecallItem(
+            memory_id=record.memory_id,
+            kind=record.kind,
+            title=record.title,
+            content=record.content,
+            score=score,
+            tags=record.tags,
+            token_count=approx_token_count(record.content),
+        )
+        for record, score in matches
+    ]
+
+    entities: dict[str, GraphEntity] = {}
+    relations: list[GraphRelation] = []
+    for record, _ in matches:
+        for entity in record.metadata.get("entities", []):
+            entity_id = entity.get("entity_id") or entity.get("name")
+            if not entity_id:
+                continue
+
+            existing = entities.get(entity_id)
+            if existing is None:
+                entities[entity_id] = GraphEntity(
+                    entity_id=entity_id,
+                    name=entity.get("name", entity_id),
+                    entity_type=entity.get("entity_type", "unknown"),
+                    memory_ids=[record.memory_id],
+                )
+            elif record.memory_id not in existing.memory_ids:
+                existing.memory_ids.append(record.memory_id)
+
+        for relation in record.metadata.get("relations", []):
+            relations.append(
+                GraphRelation(
+                    relation_id=relation.get(
+                        "relation_id", f"rel_{record.memory_id}_{len(relations)}"
+                    ),
+                    source_entity_id=relation["source_entity_id"],
+                    target_entity_id=relation["target_entity_id"],
+                    relation_type=relation["relation_type"],
+                    fact=relation["fact"],
+                    memory_ids=[record.memory_id],
+                    valid_at=relation.get("valid_at"),
+                    invalid_at=relation.get("invalid_at"),
+                )
+            )
+
+    return ActiveRecallResponse(
+        items=items,
+        entities=list(entities.values()),
+        relations=relations,
+        search_plan=[
+            "lexical score over active canonical records",
+            "expand metadata-provided entities and relations",
+        ],
+    )
+
+
+def build_active_response_with_graph(
+    *,
+    matches: list[tuple[MemoryRecord, float]],
+    graph_result: GraphSearchResult,
+) -> ActiveRecallResponse:
+    response = build_active_response(matches)
+    response.entities = [
+        GraphEntity(
+            entity_id=entity.entity_id,
+            name=entity.canonical_name,
+            entity_type=entity.entity_type.value,
+            memory_ids=entity.memory_ids,
+        )
+        for entity in graph_result.entities
+    ]
+    response.relations = [
+        GraphRelation(
+            relation_id=relation.relation_id,
+            source_entity_id=relation.source_entity_id,
+            target_entity_id=relation.target_entity_id,
+            relation_type=relation.relation_type.value,
+            fact=relation.fact,
+            memory_ids=relation.memory_ids,
+            valid_at=relation.valid_at,
+            invalid_at=relation.invalid_at,
+        )
+        for relation in graph_result.relations
+    ]
+    response.search_plan = list(graph_result.search_plan)
+    if graph_result.supporting_memory_ids:
+        response.search_plan.append("load supporting canonical memories from graph hits")
+    return response
+
+
+def merge_passive_with_graph(
+    *,
+    base_response: PassiveRecallResponse,
+    graph_records: list[MemoryRecord],
+    query: str,
+    kinds,
+    max_results: int,
+    token_budget: int,
+    graph_bonus: float = 0.35,
+) -> PassiveRecallResponse:
+    item_map: dict[str, RecallItem] = {item.memory_id: item for item in base_response.items}
+    signals = build_query_signals(query)
+
+    for record in graph_records:
+        if record.status is not RecordStatus.ACTIVE:
+            continue
+        if kinds and record.kind not in kinds:
+            continue
+
+        score = score_tokens(
+            signals.query_tokens,
+            tokenize(" ".join([record.title or "", record.content, " ".join(record.tags)])),
+        )
+        score += score_tokens(signals.query_tokens, tokenize(record.title or "")) * 0.15
+        score += kind_priority_bias(record.kind)
+        score += recency_bias(record.updated_at)
+        score += graph_bonus
+
+        existing = item_map.get(record.memory_id)
+        if existing is not None:
+            existing.score = max(existing.score, score)
+            existing.token_count = existing.token_count or approx_token_count(record.content)
+            continue
+
+        item_map[record.memory_id] = RecallItem(
+            memory_id=record.memory_id,
+            kind=record.kind,
+            title=record.title,
+            content=record.content,
+            score=score,
+            tags=record.tags,
+            token_count=approx_token_count(record.content),
+        )
+
+    ranked_items = rerank_passive_items(
+        list(item_map.values()),
+        query=query,
+        graph_memory_ids={record.memory_id for record in graph_records},
+    )
+    selected, total_token_count = select_passive_items(
+        ranked_items,
+        max_results=max_results,
+        token_budget=token_budget,
+    )
+    return PassiveRecallResponse(items=selected, total_token_count=total_token_count)
+
+
+def tokenize(text: str) -> set[str]:
+    return {token for token in re.findall(r"[A-Za-z0-9_]+", text.lower()) if token}
+
+
+def score_tokens(query_tokens: set[str], content_tokens: set[str]) -> float:
+    overlap = len(query_tokens & content_tokens)
+    if overlap == 0:
+        return 0.0
+    return overlap / len(query_tokens)
+
+
+def limit_recall_items(
+    items: list[RecallItem],
+    *,
+    max_results: int,
+    token_budget: int,
+) -> tuple[list[RecallItem], int]:
+    return select_passive_items(items, max_results=max_results, token_budget=token_budget)
+
+
+def passive_candidate_limit(
+    max_results: int,
+    *,
+    multiplier: int = 4,
+    floor: int = 12,
+    cap: int = 40,
+) -> int:
+    return min(max(max_results * multiplier, floor), cap)
+
+
+def select_passive_items(
+    items: list[RecallItem],
+    *,
+    max_results: int,
+    token_budget: int,
+) -> tuple[list[RecallItem], int]:
+    selected: list[RecallItem] = []
+    total_token_count = 0
+    seen_ids: set[str] = set()
+    if not items:
+        return selected, total_token_count
+
+    ranked_by_score = sorted(items, key=lambda item: item.score, reverse=True)
+    if token_budget > 0:
+        anchor_candidates = [
+            item
+            for item in ranked_by_score
+            if (item.token_count or approx_token_count(item.content)) <= token_budget
+        ]
+        if not anchor_candidates:
+            return selected, total_token_count
+        top_anchor = max(anchor_candidates, key=_passive_utility_score)
+    else:
+        top_anchor = ranked_by_score[0]
+
+    anchor_tokens = top_anchor.token_count or approx_token_count(top_anchor.content)
+    selected.append(top_anchor)
+    seen_ids.add(top_anchor.memory_id)
+    total_token_count += anchor_tokens
+
+    remaining = [item for item in ranked_by_score if item.memory_id not in seen_ids]
+    remaining.sort(
+        key=lambda item: _passive_utility_score(item),
+        reverse=True,
+    )
+
+    duplicate_kind_counts: dict[MemoryKind, int] = {top_anchor.kind: 1}
+    for item in remaining:
+        if len(selected) >= max_results:
+            break
+
+        token_count = item.token_count or approx_token_count(item.content)
+        if token_budget > 0 and selected and total_token_count + token_count > token_budget:
+            continue
+
+        kind_count = duplicate_kind_counts.get(item.kind, 0)
+        utility_score = _passive_utility_score(item) - (kind_count * 0.03)
+        if utility_score <= 0:
+            continue
+
+        selected.append(item)
+        seen_ids.add(item.memory_id)
+        total_token_count += token_count
+        duplicate_kind_counts[item.kind] = kind_count + 1
+
+        if token_budget > 0 and total_token_count >= token_budget:
+            break
+
+    return selected, total_token_count
+
+
+def rerank_passive_items(
+    items: list[RecallItem],
+    *,
+    query: str,
+    graph_memory_ids: set[str] | None = None,
+) -> list[RecallItem]:
+    signals = build_query_signals(query)
+    graph_memory_ids = graph_memory_ids or set()
+
+    reranked: list[RecallItem] = []
+    for item in items:
+        adjusted = item.model_copy(deep=True)
+        adjusted.score = adjusted.score + _passive_bonus(
+            adjusted,
+            signals=signals,
+            graph_memory_ids=graph_memory_ids,
+        )
+        reranked.append(adjusted)
+
+    reranked.sort(key=lambda item: item.score, reverse=True)
+    return reranked
+
+
+def kind_priority_bias(kind: MemoryKind) -> float:
+    priorities = {
+        MemoryKind.CORE_FACT: 0.20,
+        MemoryKind.AGENT_NOTE: 0.15,
+        MemoryKind.SESSION_SUMMARY: 0.05,
+        MemoryKind.TASK_SUMMARY: 0.05,
+        MemoryKind.USER_DATA: 0.00,
+        MemoryKind.TRANSCRIPT: -0.10,
+    }
+    return priorities.get(kind, 0.0)
+
+
+def recency_bias(updated_at: datetime | str | None) -> float:
+    if not updated_at:
+        return 0.0
+
+    if isinstance(updated_at, str):
+        try:
+            timestamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+    else:
+        timestamp = updated_at
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    age_days = max((datetime.now(timezone.utc) - timestamp).total_seconds() / 86_400, 0.0)
+    return (1.0 / (1.0 + age_days / 30.0)) * 0.10
+
+
+def approx_token_count(text: str) -> int:
+    return max(len(re.findall(r"[A-Za-z0-9_]+", text)), 1)
+
+
+def _passive_bonus(
+    item: RecallItem,
+    *,
+    signals: QuerySignals,
+    graph_memory_ids: set[str],
+) -> float:
+    bonus = 0.0
+    text_lower = " ".join([item.title or "", item.content, " ".join(item.tags)]).lower()
+    if item.memory_id in graph_memory_ids:
+        bonus += 0.30
+    if signals.query_lower and len(signals.query_lower) >= 12 and signals.query_lower in text_lower:
+        bonus += 0.10
+    if signals.current_state_hint and {"active", "current", "ongoing"} & {tag.lower() for tag in item.tags}:
+        bonus += 0.08
+    if item.title:
+        bonus += score_tokens(signals.query_tokens, tokenize(item.title)) * 0.12
+    for email in signals.normalized_emails:
+        if email in text_lower:
+            bonus += 0.70
+            break
+    token_count = item.token_count or approx_token_count(item.content)
+    if token_count > 1400:
+        bonus -= 0.06
+    elif token_count < 220:
+        bonus += 0.03
+    return bonus
+
+
+def _passive_utility_score(item: RecallItem) -> float:
+    token_count = item.token_count or approx_token_count(item.content)
+    return item.score / ((1.0 + (token_count / 256.0)) ** 0.5)

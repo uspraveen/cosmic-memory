@@ -1,0 +1,4 @@
+# Canonical dependency definitions live in pyproject.toml.
+# This file exists for environments and deployment flows that expect
+# a requirements.txt entry point.
+-e .
