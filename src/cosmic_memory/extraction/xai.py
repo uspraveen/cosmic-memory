@@ -27,6 +27,7 @@ Rules:
   - raw_value: primary_user
 - For relative time expressions such as today, yesterday, last week, tomorrow, next Friday, or currently, resolve them against the provided local and UTC time anchors.
 - Use absolute ISO 8601 datetimes when grounded.
+- If a relation is explicitly current, active, blocked, ongoing, or happening today/right now and no more precise timestamp is given, set valid_at to the provided Provenance created_at anchor.
 - If time is implied but not precise, prefer null over guessing.
 - valid_at means when a fact becomes true.
 - invalid_at means when a fact stops being true.

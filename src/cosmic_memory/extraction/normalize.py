@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 from cosmic_memory.domain.models import MemoryRecord
 from cosmic_memory.extraction.models import (
@@ -25,6 +26,30 @@ from cosmic_memory.graph.resolution import (
     entity_allows_name_auto_merge,
     normalized_entity_names,
     preferred_canonical_name,
+)
+
+_CURRENT_STATE_RELATIONS = {
+    RelationType.WORKS_ON,
+    RelationType.PART_OF,
+    RelationType.PREFERS,
+    RelationType.AVOIDS,
+    RelationType.BLOCKED_BY,
+    RelationType.REMIND_AT,
+}
+_CURRENT_TIME_CUE_PATTERN = re.compile(
+    r"\b("
+    r"today|currently|current|right now|as of now|at present|this morning|this afternoon|"
+    r"this evening|tonight|this week|this month|tomorrow|yesterday"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+_ABSOLUTE_DATE_PATTERN = re.compile(
+    r"\b("
+    r"\d{4}-\d{2}-\d{2}|"
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},\s+\d{4}"
+    r")\b",
+    flags=re.IGNORECASE,
 )
 
 
@@ -62,7 +87,7 @@ def normalize_extraction_result(
             dropped_relation_count=len(result.relations),
         )
 
-    return normalize_graph_document(
+    document, report = normalize_graph_document(
         GraphDocument(
             memory_id=record.memory_id,
             entities=[
@@ -76,6 +101,12 @@ def normalize_extraction_result(
             source_text=record.content,
         )
     )
+    if document is None:
+        return None, report
+    return _backfill_relation_times(
+        document,
+        anchor_time=record.provenance.created_at or record.created_at,
+    ), report
 
 
 def normalize_graph_document(
@@ -215,6 +246,23 @@ def _normalize_relation(
         invalid_at=relation.invalid_at,
         expires_at=relation.expires_at,
     )
+
+
+def _backfill_relation_times(document: GraphDocument, *, anchor_time: datetime) -> GraphDocument:
+    source_text = document.source_text or ""
+    for relation in document.relations:
+        if relation.valid_at is not None:
+            continue
+        if relation.relation_type not in _CURRENT_STATE_RELATIONS:
+            continue
+        combined_text = f"{source_text}\n{relation.fact}"
+        if _looks_temporally_anchored(combined_text):
+            relation.valid_at = anchor_time
+    return document
+
+
+def _looks_temporally_anchored(value: str) -> bool:
+    return bool(_CURRENT_TIME_CUE_PATTERN.search(value) or _ABSOLUTE_DATE_PATTERN.search(value))
 
 
 def _find_merge_target(

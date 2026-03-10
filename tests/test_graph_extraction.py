@@ -2,6 +2,8 @@ import asyncio
 import sys
 import types
 
+from datetime import UTC, datetime
+
 from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
 from cosmic_memory.domain.enums import MemoryKind
 from cosmic_memory.domain.models import (
@@ -166,6 +168,53 @@ def test_write_can_auto_extract_graph_document_and_ingest_it():
     asyncio.run(run())
 
 
+def test_normalize_extraction_result_backfills_current_relation_valid_at():
+    anchor = datetime(2026, 3, 10, 9, 30, tzinfo=UTC)
+    record = MemoryRecord(
+        memory_id="mem_temporal_backfill",
+        kind=MemoryKind.TASK_SUMMARY,
+        title="Current blocker",
+        content="Today Cosmic Memory is currently blocked by embedding latency.",
+        provenance=MemoryProvenance(
+            source_kind="gateway",
+            created_by="test",
+            created_at=anchor,
+        ),
+        created_at=anchor,
+        updated_at=anchor,
+    )
+
+    result, _report = normalize_extraction_result(
+        GraphExtractionResult(
+            should_extract=True,
+            entities=[
+                ExtractedGraphEntity(
+                    local_ref="project",
+                    entity_type=EntityType.PROJECT,
+                    canonical_name="Cosmic Memory",
+                ),
+                ExtractedGraphEntity(
+                    local_ref="blocker",
+                    entity_type=EntityType.TOPIC,
+                    canonical_name="embedding latency",
+                ),
+            ],
+            relations=[
+                ExtractedGraphRelation(
+                    source_ref="project",
+                    target_ref="blocker",
+                    relation_type=RelationType.BLOCKED_BY,
+                    fact="Cosmic Memory is currently blocked by embedding latency.",
+                )
+            ],
+        ),
+        record=record,
+    )
+
+    assert result is not None
+    assert result.relations[0].valid_at == anchor
+
+
 def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypatch):
     captured = {"messages": []}
 
@@ -222,10 +271,13 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
 
         assert result is not None
         assert captured["kwargs"]["model"] == "grok-4-1-fast-reasoning"
+        system_message = captured["messages"][0]["content"]
         user_message = captured["messages"][1]["content"]
+        assert "set valid_at to the provided Provenance created_at anchor" in system_message
         assert "Current UTC time:" in user_message
         assert "Current local time (America/Chicago):" in user_message
         assert "Memory created_at:" in user_message
+        assert "Provenance created_at:" in user_message
         assert "Today Cosmic Memory is blocked by embedding latency." in user_message
 
     asyncio.run(run())
