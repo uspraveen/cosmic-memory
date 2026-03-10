@@ -153,6 +153,62 @@ def test_passive_recall_can_be_boosted_by_graph_supporting_memory():
     asyncio.run(run())
 
 
+def test_active_recall_returns_blocker_relation_for_current_state_queries():
+    async def run():
+        graph_store = InMemoryGraphStore()
+        service = InMemoryDevelopmentMemoryService(graph_store=graph_store)
+
+        await service.write(
+            WriteMemoryRequest(
+                kind=MemoryKind.TASK_SUMMARY,
+                title="Current blocker",
+                content="Cosmic Memory is blocked by embedding latency.",
+                tags=["current", "active", "blocking"],
+                provenance=provenance(),
+                metadata={
+                    "graph_document": {
+                        "memory_id": "ignored",
+                        "entities": [
+                            {
+                                "local_ref": "project",
+                                "entity_type": EntityType.PROJECT.value,
+                                "canonical_name": "Cosmic Memory",
+                            },
+                            {
+                                "local_ref": "blocker",
+                                "entity_type": EntityType.ARTIFACT.value,
+                                "canonical_name": "Embedding latency",
+                            },
+                        ],
+                        "relations": [
+                            {
+                                "source_ref": "project",
+                                "target_ref": "blocker",
+                                "relation_type": RelationType.BLOCKED_BY.value,
+                                "fact": "Cosmic Memory is blocked by embedding latency.",
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+
+        result = await service.active_recall(
+            ActiveRecallRequest(
+                query="What is blocking Cosmic Memory right now?",
+                include_diagnostics=True,
+            )
+        )
+
+        assert result.relations
+        assert result.relations[0].relation_type == RelationType.BLOCKED_BY.value
+        assert "embedding latency" in result.relations[0].fact.casefold()
+        assert result.diagnostics is not None
+        assert result.diagnostics.flags["graph_used"] is True
+
+    asyncio.run(run())
+
+
 def test_supersede_removes_old_graph_contribution():
     async def run():
         graph_store = InMemoryGraphStore()
