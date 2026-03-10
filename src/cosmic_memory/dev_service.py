@@ -8,6 +8,7 @@ from time import perf_counter
 from cosmic_memory.core_facts import build_core_fact_block, find_active_core_fact_by_key
 from cosmic_memory.domain.enums import RecordStatus
 from cosmic_memory.domain.models import (
+    ActiveRecallDiagnostics,
     ActiveRecallRequest,
     ActiveRecallResponse,
     CoreFactBlock,
@@ -215,7 +216,12 @@ class InMemoryDevelopmentMemoryService:
         )
 
     async def active_recall(self, request: ActiveRecallRequest) -> ActiveRecallResponse:
+        service_started = perf_counter()
+        diagnostics = ActiveRecallDiagnostics() if request.include_diagnostics else None
         if self.graph_store is not None:
+            if diagnostics is not None:
+                diagnostics.flags["graph_used"] = True
+            graph_started = perf_counter()
             graph_result = await self.graph_store.traverse(
                 build_query_frame(request.query),
                 seed_entity_ids=request.seed_entities or None,
@@ -223,11 +229,23 @@ class InMemoryDevelopmentMemoryService:
                 max_entities=request.max_results,
                 max_relations=request.max_results,
             )
+            if diagnostics is not None:
+                diagnostics.timings_ms["graph_traverse_ms"] = round(
+                    (perf_counter() - graph_started) * 1000.0,
+                    3,
+                )
+            load_started = perf_counter()
             graph_records = [
                 self._records[memory_id]
                 for memory_id in graph_result.supporting_memory_ids
                 if memory_id in self._records and self._records[memory_id].status == RecordStatus.ACTIVE
             ]
+            if diagnostics is not None:
+                diagnostics.timings_ms["graph_load_records_ms"] = round(
+                    (perf_counter() - load_started) * 1000.0,
+                    3,
+                )
+            match_started = perf_counter()
             matches = search_records(
                 graph_records,
                 request.query,
@@ -235,15 +253,47 @@ class InMemoryDevelopmentMemoryService:
                 limit=request.max_results,
                 score_boosts={memory_id: 0.5 for memory_id in graph_result.supporting_memory_ids},
             )
-            return build_active_response_with_graph(matches=matches, graph_result=graph_result)
+            if diagnostics is not None:
+                diagnostics.timings_ms["graph_match_ms"] = round(
+                    (perf_counter() - match_started) * 1000.0,
+                    3,
+                )
+                diagnostics.counters["supporting_memory_count"] = len(graph_result.supporting_memory_ids)
+                diagnostics.counters["entity_count"] = len(graph_result.entities)
+                diagnostics.counters["relation_count"] = len(graph_result.relations)
+                diagnostics.counters["matched_memory_count"] = len(matches)
+            response = build_active_response_with_graph(
+                matches=matches,
+                graph_result=graph_result,
+                diagnostics=diagnostics,
+            )
+            return self._finalize_active_response(
+                response,
+                diagnostics=diagnostics,
+                started_at=service_started,
+            )
 
+        if diagnostics is not None:
+            diagnostics.flags["graph_used"] = False
+        search_started = perf_counter()
         matches = search_records(
             self._records.values(),
             request.query,
             request.kinds,
             limit=request.max_results,
         )
-        return build_active_response(matches)
+        if diagnostics is not None:
+            diagnostics.timings_ms["lexical_search_ms"] = round(
+                (perf_counter() - search_started) * 1000.0,
+                3,
+            )
+            diagnostics.counters["matched_memory_count"] = len(matches)
+        response = build_active_response(matches, diagnostics=diagnostics)
+        return self._finalize_active_response(
+            response,
+            diagnostics=diagnostics,
+            started_at=service_started,
+        )
 
     async def get_index_status(self) -> IndexStatusResponse:
         return IndexStatusResponse(enabled=False, canonical_count=len(self._records))
@@ -339,6 +389,24 @@ class InMemoryDevelopmentMemoryService:
         diagnostics: PassiveRecallDiagnostics | None,
         started_at: float,
     ) -> PassiveRecallResponse:
+        if diagnostics is None:
+            return response
+
+        diagnostics.timings_ms["service_total_ms"] = round(
+            (perf_counter() - started_at) * 1000.0,
+            3,
+        )
+        if response.diagnostics is diagnostics:
+            return response
+        return response.model_copy(update={"diagnostics": diagnostics})
+
+    @staticmethod
+    def _finalize_active_response(
+        response: ActiveRecallResponse,
+        *,
+        diagnostics: ActiveRecallDiagnostics | None,
+        started_at: float,
+    ) -> ActiveRecallResponse:
         if diagnostics is None:
             return response
 

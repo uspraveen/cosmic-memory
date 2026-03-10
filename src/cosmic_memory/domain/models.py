@@ -239,6 +239,14 @@ class ActiveRecallRequest(BaseModel):
     seed_entities: list[str] = Field(default_factory=list)
     max_results: int = 12
     max_hops: int = 2
+    include_diagnostics: bool = False
+
+
+class ActiveRecallDiagnostics(BaseModel):
+    timings_ms: dict[str, float] = Field(default_factory=dict)
+    counters: dict[str, int] = Field(default_factory=dict)
+    flags: dict[str, bool] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
 
 
 class ActiveRecallResponse(BaseModel):
@@ -246,6 +254,7 @@ class ActiveRecallResponse(BaseModel):
     entities: list[GraphEntity] = Field(default_factory=list)
     relations: list[GraphRelation] = Field(default_factory=list)
     search_plan: list[str] = Field(default_factory=list)
+    diagnostics: ActiveRecallDiagnostics | None = None
 
 
 class HealthStatus(BaseModel):

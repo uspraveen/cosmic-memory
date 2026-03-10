@@ -11,6 +11,7 @@ from time import perf_counter
 from cosmic_memory.domain.enums import MemoryKind, RecordStatus
 from cosmic_memory.domain.models import (
     ActiveRecallResponse,
+    ActiveRecallDiagnostics,
     GraphEntity,
     GraphRelation,
     MemoryRecord,
@@ -139,7 +140,11 @@ def build_passive_response(
     )
 
 
-def build_active_response(matches: list[tuple[MemoryRecord, float]]) -> ActiveRecallResponse:
+def build_active_response(
+    matches: list[tuple[MemoryRecord, float]],
+    *,
+    diagnostics: ActiveRecallDiagnostics | None = None,
+) -> ActiveRecallResponse:
     items = [
         RecallItem(
             memory_id=record.memory_id,
@@ -196,6 +201,7 @@ def build_active_response(matches: list[tuple[MemoryRecord, float]]) -> ActiveRe
             "lexical score over active canonical records",
             "expand metadata-provided entities and relations",
         ],
+        diagnostics=diagnostics,
     )
 
 
@@ -203,8 +209,9 @@ def build_active_response_with_graph(
     *,
     matches: list[tuple[MemoryRecord, float]],
     graph_result: GraphSearchResult,
+    diagnostics: ActiveRecallDiagnostics | None = None,
 ) -> ActiveRecallResponse:
-    response = build_active_response(matches)
+    response = build_active_response(matches, diagnostics=diagnostics)
     response.entities = [
         GraphEntity(
             entity_id=entity.entity_id,

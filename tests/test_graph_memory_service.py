@@ -71,7 +71,10 @@ def test_active_recall_prefers_graph_traversal_when_available():
         )
 
         result = await service.active_recall(
-            ActiveRecallRequest(query="What project does nxagarwal@ualr.edu work on?")
+            ActiveRecallRequest(
+                query="What project does nxagarwal@ualr.edu work on?",
+                include_diagnostics=True,
+            )
         )
 
         assert result.items
@@ -79,6 +82,9 @@ def test_active_recall_prefers_graph_traversal_when_available():
         assert result.entities
         assert result.relations
         assert result.relations[0].relation_type == RelationType.WORKS_ON.value
+        assert result.diagnostics is not None
+        assert result.diagnostics.flags["graph_used"] is True
+        assert result.diagnostics.timings_ms["graph_traverse_ms"] >= 0
 
     asyncio.run(run())
 

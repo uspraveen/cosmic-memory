@@ -56,11 +56,18 @@ def test_active_recall_returns_entities():
         service = InMemoryDevelopmentMemoryService()
         await _seed(service)
         result = await service.active_recall(
-            ActiveRecallRequest(query="user preferences", max_results=5)
+            ActiveRecallRequest(
+                query="user preferences",
+                max_results=5,
+                include_diagnostics=True,
+            )
         )
         assert len(result.items) == 1
         assert len(result.entities) == 1
         assert result.entities[0].entity_id == "user"
+        assert result.diagnostics is not None
+        assert result.diagnostics.flags["graph_used"] is False
+        assert result.diagnostics.timings_ms["lexical_search_ms"] >= 0
 
     asyncio.run(run())
 
