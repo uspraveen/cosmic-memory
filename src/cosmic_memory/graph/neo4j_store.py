@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import hashlib
 import json
 from datetime import datetime
@@ -610,8 +611,8 @@ class Neo4jGraphStore:
         store._entities = entities
         store._identity_keys = identity_keys
         store._relations = relations
-        store._key_to_entities = key_to_entities
-        store._entity_to_relations = entity_to_relations
+        store._key_to_entities = defaultdict(set, key_to_entities)
+        store._entity_to_relations = defaultdict(set, entity_to_relations)
         return store
 
     async def _cache_ingest_document(self, document: GraphDocument) -> None:
