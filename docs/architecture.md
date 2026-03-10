@@ -93,6 +93,8 @@ The current codebase now includes the first graph layer needed to support this:
 - a typed ontology,
 - deterministic identity-key normalization,
 - strict merge rules for strong vs weak identity evidence,
+- exact-name auto-merge for non-person entities such as projects and tasks,
+- write-time LLM extraction into canonical `graph_document` payloads,
 - one-hop graph-assisted passive recall,
 - graph-first active traversal when a graph store is attached.
 
@@ -120,6 +122,18 @@ The planned storage split is:
   - graph backend
 
 The graph is a projection, not the primary source of truth.
+
+When graph extraction is enabled, canonical write flow becomes:
+
+1. write request enters the memory service,
+2. an LLM extracts entities, identity candidates, aliases, typed relations, and temporal fields,
+3. the extraction result is deduplicated and normalized locally,
+4. the normalized `graph_document` is written back into canonical Markdown metadata,
+5. the same normalized document is ingested into the graph projection,
+6. the passive index is updated independently.
+
+This keeps graph intelligence on the ingestion side and keeps passive recall
+free of query-time LLM latency.
 
 At the moment, the implemented graph backends are intentionally limited:
 
@@ -234,6 +248,5 @@ The current milestone in this repo now includes:
 
 The next backend milestones are:
 
-- graph projection,
-- retrieval benchmarking on Linux against the HTTP path,
+- active query planning for orchestrator-driven traversal,
 - consolidation workflows.

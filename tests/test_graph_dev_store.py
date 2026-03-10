@@ -139,3 +139,38 @@ def test_passive_search_returns_one_hop_relation_from_email_seed():
         assert "mem_rel_1" in result.supporting_memory_ids
 
     asyncio.run(run())
+
+
+def test_graph_store_auto_merges_same_project_name_across_documents():
+    async def run():
+        store = InMemoryGraphStore()
+        first = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_project_1",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    )
+                ],
+            )
+        )
+        second = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_project_2",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    )
+                ],
+            )
+        )
+
+        assert len(first.entity_ids) == 1
+        assert second.entity_ids == first.entity_ids
+        assert second.resolution_events[0].status == "exact_match"
+
+    asyncio.run(run())

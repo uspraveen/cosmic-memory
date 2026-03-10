@@ -8,6 +8,7 @@ This repo uses `pyproject.toml` as the canonical package and dependency definiti
 - Python `3.11+`
 - `pip`
 - A Perplexity API key for dense embeddings
+- An xAI API key if you enable write-time graph extraction
 - Qdrant available either:
   - locally via `COSMIC_MEMORY_QDRANT_PATH`, or
   - remotely via `COSMIC_MEMORY_QDRANT_URL`
@@ -32,6 +33,12 @@ Development install with the Neo4j graph backend:
 python -m pip install -e .[dev,graph]
 ```
 
+Development install with Neo4j and xAI graph extraction:
+
+```bash
+python -m pip install -e .[dev,graph,llm]
+```
+
 Development install with the local-path Qdrant BM25 stack:
 
 ```bash
@@ -46,6 +53,15 @@ Required:
 
 ```env
 PERPLEXITY_API_KEY=your_key_here
+```
+
+If you enable write-time graph extraction, also set:
+
+```env
+XAI_API_KEY=your_key_here
+COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED=true
+COSMIC_MEMORY_GRAPH_EXTRACT_MODEL=grok-4-1-fast-reasoning
+COSMIC_MEMORY_TIMEZONE=America/Chicago
 ```
 
 Common optional variables:
@@ -81,6 +97,15 @@ COSMIC_MEMORY_NEO4J_URI=bolt://127.0.0.1:7687
 COSMIC_MEMORY_NEO4J_USERNAME=neo4j
 COSMIC_MEMORY_NEO4J_PASSWORD=your_password
 COSMIC_MEMORY_NEO4J_DATABASE=neo4j
+```
+
+Optional graph extraction tuning:
+
+```env
+COSMIC_MEMORY_GRAPH_EXTRACT_MAX_PARALLEL=2
+COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES=3
+COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_BASE_SECONDS=1.0
+COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS=12.0
 ```
 
 ## Qdrant Notes
@@ -161,6 +186,8 @@ This repo currently provides:
 - SQLite registry
 - first-class `core_fact`
 - Qdrant passive recall
+- write-time xAI graph extraction into canonical `graph_document` metadata
+- graph-assisted passive recall and graph-first active recall
 - index sync and rebuild
 
 It does not yet provide the full Gateway-side compaction and session summarization loop.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from time import perf_counter
 
 from cosmic_memory.core_facts import build_core_fact_block, find_active_core_fact_by_key
@@ -24,7 +25,8 @@ from cosmic_memory.domain.models import (
     WriteMemoryRequest,
     utc_now,
 )
-from cosmic_memory.graph import GraphStore, build_query_frame, graph_document_from_memory_record
+from cosmic_memory.extraction.base import GraphExtractionService
+from cosmic_memory.graph import GraphStore, build_query_frame, ensure_graph_document_for_record
 from cosmic_memory.retrieval import (
     build_active_response,
     build_active_response_with_graph,
@@ -34,6 +36,8 @@ from cosmic_memory.retrieval import (
     search_records,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class InMemoryDevelopmentMemoryService:
     """Small in-memory service used to pin down contracts before real backends exist."""
@@ -42,10 +46,12 @@ class InMemoryDevelopmentMemoryService:
         self,
         *,
         graph_store: GraphStore | None = None,
+        graph_extractor: GraphExtractionService | None = None,
         passive_graph_timeout_seconds: float = 0.12,
     ) -> None:
         self._records: dict[str, MemoryRecord] = {}
         self.graph_store = graph_store
+        self.graph_extractor = graph_extractor
         self.passive_graph_timeout_seconds = passive_graph_timeout_seconds
 
     async def health(self) -> HealthStatus:
@@ -60,6 +66,7 @@ class InMemoryDevelopmentMemoryService:
             metadata=request.metadata,
             provenance=request.provenance,
         )
+        await self._prepare_record(record)
         self._records[record.memory_id] = record
         await self._sync_graph_record(record)
         return record
@@ -343,10 +350,22 @@ class InMemoryDevelopmentMemoryService:
         await self.graph_store.remove_memory(record.memory_id)
         if record.status != RecordStatus.ACTIVE:
             return
-        document = graph_document_from_memory_record(record)
+        document = await ensure_graph_document_for_record(
+            record,
+            extractor=self.graph_extractor,
+        )
         if document is None:
             return
         await self.graph_store.ingest_document(document)
+
+    async def _prepare_record(self, record: MemoryRecord) -> None:
+        try:
+            await ensure_graph_document_for_record(
+                record,
+                extractor=self.graph_extractor,
+            )
+        except Exception:
+            logger.exception("Graph extraction failed for memory %s", record.memory_id)
 
     def _build_base_passive_response(
         self,

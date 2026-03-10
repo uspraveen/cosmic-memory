@@ -44,13 +44,14 @@ The current milestone in this repo provides:
 - startup and on-demand index sync/rebuild operations,
 - token-budget-aware passive recall with multi-factor reranking,
 - graph ontology and deterministic identity normalization foundations,
+- write-time xAI graph extraction with structured output support,
+- document-level graph dedup normalization before graph ingest,
 - graph-assisted passive recall and graph-first active recall when a graph store is attached,
 - a thin FastAPI server,
 - an in-memory development implementation for contract testing.
 
 That gives us a real shape for the system before wiring in:
 
-- graph projection and traversal,
 - consolidation and supersession jobs.
 
 ## Repository Layout
@@ -90,12 +91,16 @@ Production behavior:
 `PERPLEXITY_API_KEY` and use Perplexity standard embeddings with
 `pplx-embed-v1-4b`.
 
+If `XAI_API_KEY` is present, production app factories also enable write-time
+graph extraction with `grok-4-1-fast-reasoning` by default.
+
 Production app factories also load a local `.env` file if present. A placeholder
 is included in [.env.example](C:/Users/Praveen Raj U S/Downloads/cosmic-memory/.env.example).
 
 Relevant environment variables:
 
 - `PERPLEXITY_API_KEY`
+- `XAI_API_KEY`
 - `COSMIC_MEMORY_EMBEDDING_MODEL` (default `pplx-embed-v1-4b`)
 - `COSMIC_MEMORY_EMBEDDING_DIMENSIONS` (default `1024`)
 - `COSMIC_MEMORY_EMBED_BATCH_SIZE` (default `128`)
@@ -112,6 +117,13 @@ Relevant environment variables:
 - `COSMIC_MEMORY_NEO4J_USERNAME`
 - `COSMIC_MEMORY_NEO4J_PASSWORD`
 - `COSMIC_MEMORY_NEO4J_DATABASE` (default `neo4j`)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED` (default `true` when `XAI_API_KEY` is present)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_MODEL` (default `grok-4-1-fast-reasoning`)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_PARALLEL` (default `2`)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES` (default `3`)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_BASE_SECONDS` (default `1.0`)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_TIMEZONE` (default `UTC`)
 - `COSMIC_MEMORY_ENV_FILE` (default `.env`)
 
 Passive retrieval notes:
@@ -131,6 +143,9 @@ Graph notes:
 - identity keys are deterministic and normalized before hashing,
 - exact strong keys such as email auto-link entities,
 - weak alias keys do not auto-merge by themselves,
+- non-person entities such as `project`, `task`, and `organization` can auto-merge by exact normalized name,
+- write-time extraction stores normalized `graph_document` payloads back into canonical Markdown,
+- extraction prompts are explicitly time-aware and resolve relative dates against UTC and local timezone anchors,
 - current graph backend support in the app factory is intentionally limited to:
   - `memory` for local/dev validation
   - `neo4j` as the first persistent backend boundary
@@ -168,6 +183,6 @@ Index behavior is aligned with the current Cosmic architecture:
 ## Near-Term Plan
 
 1. Integrate passive recall with Cosmic Gateway session assembly.
-2. Add active graph-backed memory traversal.
+2. Add active query-planning tools for orchestrator-driven memory surfing.
 3. Add consolidation and conflict-resolution jobs.
 4. Expose agent-facing memory APIs for traversal and maintenance.

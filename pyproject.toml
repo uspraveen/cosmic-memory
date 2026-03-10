@@ -25,6 +25,9 @@ dev = [
 graph = [
   "neo4j>=5.26,<6.0",
 ]
+llm = [
+  "xai-sdk>=0.1,<2.0",
+]
 qdrant-local = [
   "fastembed>=0.7,<1.0",
 ]

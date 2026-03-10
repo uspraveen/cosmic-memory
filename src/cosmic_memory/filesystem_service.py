@@ -28,7 +28,8 @@ from cosmic_memory.domain.models import (
     WriteMemoryRequest,
     utc_now,
 )
-from cosmic_memory.graph import GraphStore, build_query_frame, graph_document_from_memory_record
+from cosmic_memory.extraction.base import GraphExtractionService
+from cosmic_memory.graph import GraphStore, build_query_frame, ensure_graph_document_for_record
 from cosmic_memory.index.base import PassiveMemoryIndex
 from cosmic_memory.retrieval import (
     build_active_response,
@@ -53,6 +54,7 @@ class FilesystemMemoryService:
         *,
         passive_index: PassiveMemoryIndex | None = None,
         graph_store: GraphStore | None = None,
+        graph_extractor: GraphExtractionService | None = None,
         index_sync_batch_size: int = 128,
         passive_graph_timeout_seconds: float = 0.12,
     ) -> None:
@@ -62,6 +64,7 @@ class FilesystemMemoryService:
         self.registry = SQLiteMemoryRegistry(self.root_dir / "registry.db")
         self.passive_index = passive_index
         self.graph_store = graph_store
+        self.graph_extractor = graph_extractor
         self.index_sync_batch_size = index_sync_batch_size
         self.passive_graph_timeout_seconds = passive_graph_timeout_seconds
 
@@ -383,6 +386,7 @@ class FilesystemMemoryService:
         return replacement
 
     async def _persist(self, record: MemoryRecord) -> None:
+        await self._prepare_record(record)
         write_result = self.record_store.write(record)
         self.registry.upsert(record, write_result.path, write_result.content_hash)
         await self._sync_graph_record(record)
@@ -613,10 +617,22 @@ class FilesystemMemoryService:
         await self.graph_store.remove_memory(record.memory_id)
         if record.status != RecordStatus.ACTIVE:
             return
-        document = graph_document_from_memory_record(record)
+        document = await ensure_graph_document_for_record(
+            record,
+            extractor=self.graph_extractor,
+        )
         if document is None:
             return
         await self.graph_store.ingest_document(document)
+
+    async def _prepare_record(self, record: MemoryRecord) -> None:
+        try:
+            await ensure_graph_document_for_record(
+                record,
+                extractor=self.graph_extractor,
+            )
+        except Exception:
+            logger.exception("Graph extraction failed for memory %s", record.memory_id)
 
     @staticmethod
     def _finalize_passive_response(

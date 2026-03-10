@@ -23,12 +23,7 @@ from cosmic_memory.graph.models import (
     IdentityResolutionResult,
 )
 from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
-
-STRONG_KEY_TYPES = {
-    IdentityKeyType.EMAIL,
-    IdentityKeyType.PHONE,
-    IdentityKeyType.EXTERNAL_ACCOUNT,
-}
+from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
 
 
 class Neo4jGraphStore:
@@ -320,6 +315,17 @@ class Neo4jGraphStore:
                         )
                         for entity_id in sorted(strong_matches)
                     ],
+                )
+            )
+        elif entity_allows_name_auto_merge(document_entity.entity_type) and len(weak_matches) == 1:
+            entity_id = next(iter(weak_matches))
+            resolved_entity = await self.get_entity(entity_id)
+            if resolved_entity is None:
+                resolved_entity = _new_entity(memory_id, document_entity, provisional=False)
+            resolution_events.append(
+                IdentityResolutionResult(
+                    status="exact_match",
+                    entity_id=entity_id,
                 )
             )
         elif weak_matches:

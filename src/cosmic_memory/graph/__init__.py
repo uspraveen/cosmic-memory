@@ -9,7 +9,11 @@ from cosmic_memory.graph.identity import (
     normalize_identity_value,
     normalize_name_variant,
 )
-from cosmic_memory.graph.ingestion import graph_document_from_memory_record
+from cosmic_memory.graph.ingestion import (
+    ensure_graph_document_for_record,
+    graph_document_from_memory_record,
+    should_extract_graph_for_kind,
+)
 from cosmic_memory.graph.models import (
     GraphDocument,
     GraphDocumentEntity,
@@ -26,6 +30,7 @@ from cosmic_memory.graph.models import (
 from cosmic_memory.graph.neo4j_store import Neo4jGraphStore
 from cosmic_memory.graph.ontology import EntityType, IdentityKeyType, QueryIntent, RelationType
 from cosmic_memory.graph.query import build_query_frame
+from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
 
 __all__ = [
     "EntityType",
@@ -49,8 +54,12 @@ __all__ = [
     "build_identity_key",
     "build_query_frame",
     "deterministic_identity_key_id",
+    "ensure_graph_document_for_record",
+    "entity_allows_name_auto_merge",
     "graph_document_from_memory_record",
     "normalize_email",
     "normalize_identity_value",
     "normalize_name_variant",
+    "should_extract_graph_for_kind",
+    "STRONG_KEY_TYPES",
 ]

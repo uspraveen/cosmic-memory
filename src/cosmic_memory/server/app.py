@@ -19,6 +19,7 @@ from cosmic_memory.domain.models import (
 from cosmic_memory.embeddings import HashEmbeddingService, PerplexityStandardEmbeddingService
 from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.env import load_env_file
+from cosmic_memory.extraction import XAIGraphExtractionService
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
@@ -140,11 +141,13 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
         default_path=str(Path(data_root) / "qdrant_data"),
     )
     graph_store = _build_graph_store_from_env()
+    graph_extractor = _build_graph_extractor_from_env()
     return create_app(
         FilesystemMemoryService(
             data_root,
             passive_index=passive_index,
             graph_store=graph_store,
+            graph_extractor=graph_extractor,
             passive_graph_timeout_seconds=float(
                 os.environ.get("COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS", "120")
             )
@@ -268,4 +271,37 @@ def _build_graph_store_from_env():
     raise RuntimeError(
         f"Unsupported graph backend: {backend}. "
         "Supported values are `none`, `memory`, and `neo4j`."
+    )
+
+
+def _build_graph_extractor_from_env():
+    raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED")
+    api_key = os.environ.get("XAI_API_KEY")
+    if raw_enabled is None:
+        enabled = bool(api_key)
+    else:
+        enabled = raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+    if not api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required when graph extraction is enabled."
+        )
+    return XAIGraphExtractionService(
+        api_key=api_key,
+        model_name=os.environ.get(
+            "COSMIC_MEMORY_GRAPH_EXTRACT_MODEL",
+            "grok-4-1-fast-reasoning",
+        ),
+        timezone_name=os.environ.get("COSMIC_MEMORY_TIMEZONE", "UTC"),
+        max_parallel_requests=int(
+            os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_MAX_PARALLEL", "2")
+        ),
+        max_retries=int(os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES", "3")),
+        retry_base_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_BASE_SECONDS", "1.0")
+        ),
+        retry_max_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS", "12.0")
+        ),
     )

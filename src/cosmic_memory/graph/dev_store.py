@@ -21,12 +21,7 @@ from cosmic_memory.graph.models import (
     IdentityResolutionResult,
 )
 from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
-
-STRONG_KEY_TYPES = {
-    IdentityKeyType.EMAIL,
-    IdentityKeyType.PHONE,
-    IdentityKeyType.EXTERNAL_ACCOUNT,
-}
+from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
 
 
 class InMemoryGraphStore:
@@ -245,6 +240,15 @@ class InMemoryGraphStore:
                         )
                         for entity_id in sorted(strong_matches)
                     ],
+                )
+            )
+        elif entity_allows_name_auto_merge(entity.entity_type) and len(weak_matches) == 1:
+            entity_id = next(iter(weak_matches))
+            resolved_entity = self._entities[entity_id]
+            resolution_events.append(
+                IdentityResolutionResult(
+                    status="exact_match",
+                    entity_id=entity_id,
                 )
             )
         elif weak_matches:
