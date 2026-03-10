@@ -118,6 +118,7 @@ Passive retrieval notes:
 - dense vectors come from Perplexity embeddings,
 - sparse retrieval defaults to Qdrant-native BM25,
 - `qdrant-client>=1.15.2` is required for the native BM25 path,
+- local-path Qdrant with native BM25 also requires `fastembed` in the client environment,
 - explicit sparse encoders are still supported for tests and older environments.
 - passive recall overfetches a bounded candidate window, reranks by lexical/index score, type, recency, exact identity hits, current-state hints, graph support, and token cost,
 - final selection packs the token budget instead of blindly taking the biggest top hit,

@@ -72,6 +72,11 @@ class QdrantHybridMemoryIndex:
                 "Qdrant-native BM25 requires qdrant-client>=1.15.2. "
                 "Upgrade qdrant-client or inject an explicit SparseEncoder fallback."
             )
+        if self.sparse_encoder is None and path is not None and not _has_fastembed():
+            raise RuntimeError(
+                "Local-path Qdrant native BM25 requires fastembed in the client environment. "
+                "Install `fastembed` or inject an explicit SparseEncoder fallback."
+            )
 
     async def ensure_ready(self) -> None:
         if self._ready:
@@ -416,6 +421,14 @@ def _supports_qdrant_native_bm25() -> bool:
     current = _parse_version(raw_version)
     minimum = (1, 15, 2)
     return current >= minimum
+
+
+def _has_fastembed() -> bool:
+    try:
+        import fastembed  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _parse_version(raw_version: str) -> tuple[int, int, int]:

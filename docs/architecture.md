@@ -149,6 +149,8 @@ isolated from storage:
 - Qdrant sync/search calls the same embedding service instead of generating
   vectors inline,
 - native BM25 text conversion happens inside Qdrant by default,
+- local-path Qdrant still requires `fastembed` in the client environment for
+  native document/sparse inference,
 - explicit sparse encoders remain available as a fallback for tests and older clients.
 
 The passive index now also includes an explicit control plane:

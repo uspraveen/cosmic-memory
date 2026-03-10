@@ -32,6 +32,12 @@ Development install with the Neo4j graph backend:
 python -m pip install -e .[dev,graph]
 ```
 
+Development install with the local-path Qdrant BM25 stack:
+
+```bash
+python -m pip install -e .[dev,qdrant-local]
+```
+
 ## Environment
 
 Create a local `.env` file in the repo root or export variables directly.
@@ -80,6 +86,7 @@ COSMIC_MEMORY_NEO4J_DATABASE=neo4j
 
 - Production defaults to Qdrant-native BM25 for sparse retrieval.
 - This requires `qdrant-client>=1.15.2`.
+- If you use `COSMIC_MEMORY_QDRANT_PATH` with native BM25, install `fastembed` too.
 - Dense embeddings still come from Perplexity.
 - Canonical Markdown remains the source of truth; Qdrant is a rebuildable index.
 

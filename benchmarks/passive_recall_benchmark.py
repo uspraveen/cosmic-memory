@@ -25,7 +25,11 @@ from cosmic_memory.domain.models import MemoryProvenance, PassiveRecallRequest, 
 from cosmic_memory.embeddings.hash import HashEmbeddingService
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import InMemoryGraphStore
-from cosmic_memory.index.qdrant import QdrantHybridMemoryIndex, _supports_qdrant_native_bm25
+from cosmic_memory.index.qdrant import (
+    QdrantHybridMemoryIndex,
+    _has_fastembed,
+    _supports_qdrant_native_bm25,
+)
 from cosmic_memory.index.sparse import SimpleSparseEncoder
 
 
@@ -238,7 +242,7 @@ async def seed_http_service(client: httpx.AsyncClient, total_records: int) -> No
 async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
     graph_store = InMemoryGraphStore() if args.graph_backend == "memory" else None
     with tempfile.TemporaryDirectory(prefix="cosmic-memory-bench-", dir=args.data_dir) as tmp:
-        if _supports_qdrant_native_bm25():
+        if _supports_qdrant_native_bm25() and _has_fastembed():
             index = QdrantHybridMemoryIndex(
                 embedding_service=HashEmbeddingService(dimensions=256),
                 path=str(Path(tmp) / "qdrant"),

@@ -25,6 +25,9 @@ dev = [
 graph = [
   "neo4j>=5.26,<6.0",
 ]
+qdrant-local = [
+  "fastembed>=0.7,<1.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
