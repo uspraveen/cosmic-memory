@@ -28,7 +28,7 @@ from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.embeddings.hash import HashEmbeddingService
 from cosmic_memory.env import load_env_file
 from cosmic_memory.filesystem_service import FilesystemMemoryService
-from cosmic_memory.graph import InMemoryGraphStore
+from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
 from cosmic_memory.index.qdrant import (
     QdrantHybridMemoryIndex,
     _has_fastembed,
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--graph-backend", choices=["none", "memory"], default="memory")
+    parser.add_argument("--graph-backend", choices=["none", "memory", "neo4j"], default="memory")
     parser.add_argument("--graph-timeout-ms", type=int, default=120)
     parser.add_argument("--data-dir", default=None, help="Optional benchmark data directory.")
     parser.add_argument("--json-out", default=None)
@@ -260,7 +260,7 @@ async def seed_http_service(client: httpx.AsyncClient, total_records: int) -> No
 
 async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
     load_env_file()
-    graph_store = InMemoryGraphStore() if args.graph_backend == "memory" else None
+    graph_store = build_graph_store(args)
     embedding_service = build_embedding_service(args)
     with benchmark_workdir(args.data_dir) as tmp:
         if _has_fastembed():
@@ -292,22 +292,24 @@ async def run_inprocess_benchmark(args: argparse.Namespace) -> dict:
         await seed_inprocess_service(service, args.records)
         service.passive_index = index
         await service.sync_index()
-        report = await _exercise_passive_recall(
-            lambda case: service.passive_recall(
-                PassiveRecallRequest(
-                    query=case.query,
-                    max_results=case.max_results,
-                    token_budget=case.token_budget,
-                    include_diagnostics=True,
-                )
-            ),
-            warmup=args.warmup,
-            iterations=args.iterations,
-            concurrency=args.concurrency,
-        )
-        await index.close()
-        await embedding_service.close()
-        return report
+        try:
+            return await _exercise_passive_recall(
+                lambda case: service.passive_recall(
+                    PassiveRecallRequest(
+                        query=case.query,
+                        max_results=case.max_results,
+                        token_budget=case.token_budget,
+                        include_diagnostics=True,
+                    )
+                ),
+                warmup=args.warmup,
+                iterations=args.iterations,
+                concurrency=args.concurrency,
+            )
+        finally:
+            await close_if_present(graph_store)
+            await index.close()
+            await embedding_service.close()
 
 
 async def run_http_benchmark(args: argparse.Namespace) -> dict:
@@ -439,6 +441,39 @@ def build_embedding_service(args: argparse.Namespace) -> EmbeddingService:
         retry_base_seconds=args.embed_retry_base_seconds,
         retry_max_seconds=args.embed_retry_max_seconds,
     )
+
+
+def build_graph_store(args: argparse.Namespace):
+    import os
+
+    if args.graph_backend == "none":
+        return None
+    if args.graph_backend == "memory":
+        return InMemoryGraphStore()
+    return Neo4jGraphStore(
+        uri=require_env("COSMIC_MEMORY_NEO4J_URI"),
+        username=require_env("COSMIC_MEMORY_NEO4J_USERNAME"),
+        password=require_env("COSMIC_MEMORY_NEO4J_PASSWORD"),
+        database=os.environ.get("COSMIC_MEMORY_NEO4J_DATABASE", "neo4j"),
+    )
+
+
+def require_env(name: str) -> str:
+    import os
+
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required for the Neo4j benchmark path.")
+    return value
+
+
+async def close_if_present(resource) -> None:
+    if resource is None:
+        return
+    close = getattr(resource, "close", None)
+    if close is None:
+        return
+    await close()
 
 
 @contextmanager
