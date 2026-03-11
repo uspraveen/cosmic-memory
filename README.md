@@ -266,24 +266,26 @@ Benchmarking:
 
 Current server endpoints:
 
-- `GET /health`
-- `POST /v1/embeddings/generate`
-- `POST /v1/memories`
-- `GET /v1/memories/{memory_id}`
-- `POST /v1/memories/{memory_id}/supersede`
-- `POST /v1/core-facts`
-- `GET /v1/core-facts`
-- `POST /v1/query/passive`
-- `POST /v1/query/active`
-- `GET /v1/agent/schema-context`
-- `POST /v1/agent/plan`
-- `POST /v1/agent/resolve-identity`
-- `POST /v1/agent/current-state`
-- `POST /v1/agent/temporal-facts`
-- `POST /v1/agent/memory-brief`
-- `GET /v1/index/status`
-- `POST /v1/index/sync`
-- `POST /v1/index/rebuild`
+| Method | Path | Purpose | Used By | Notes |
+| --- | --- | --- | --- | --- |
+| `GET` | `/health` | Health/status check for the service. | Infra, local dev, Gateway | Not memory-specific. |
+| `POST` | `/v1/embeddings/generate` | Generate dense embeddings through the configured embedding backend. | Internal tooling, diagnostics, future batch jobs | Not on the normal recall hot path. |
+| `POST` | `/v1/memories` | Write a canonical long-term memory record. | Gateway, agents, orchestrator | Canonical `.md` write path. |
+| `GET` | `/v1/memories/{memory_id}` | Fetch one canonical memory by ID. | Gateway, agents, orchestrator | Direct record lookup. |
+| `POST` | `/v1/memories/{memory_id}/supersede` | Supersede an existing memory with a replacement record. | Gateway, agents, consolidation jobs | Preserves history instead of blind overwrite. |
+| `POST` | `/v1/core-facts` | Write a first-class `core_fact` record. | Gateway, profile updates, agents | Supports `canonical_key`-based supersession. |
+| `GET` | `/v1/core-facts` | Build the deterministic always-on core profile block. | Gateway | Hot prompt-assembly dependency. |
+| `POST` | `/v1/query/passive` | Fast token-budgeted passive recall for every query. | Gateway | Hot path. Qdrant-first, graph-assisted. |
+| `POST` | `/v1/query/active` | Deep memory search and graph-backed active recall. | Orchestrator, agents | Not hot path. Used for harder memory tasks. |
+| `GET` | `/v1/agent/schema-context` | Return ontology, memory kinds, and tool guidance for planning. | Orchestrator, agents | Schema injection surface. |
+| `POST` | `/v1/agent/plan` | Convert a query into a memory search plan. | Orchestrator, agents | Planning helper, not raw DB access. |
+| `POST` | `/v1/agent/resolve-identity` | Normalize and resolve identity keys such as email or username. | Orchestrator, agents | Exact identity tool. |
+| `POST` | `/v1/agent/current-state` | Return current facts such as blockers, reminders, ownership, or active work. | Orchestrator, agents | Current-state oriented graph lookup. |
+| `POST` | `/v1/agent/temporal-facts` | Return historical or time-bounded facts. | Orchestrator, agents | For before/after/when questions. |
+| `POST` | `/v1/agent/memory-brief` | Build a structured memory brief from passive + active evidence. | Orchestrator, agents | High-level agent-facing synthesis tool. |
+| `GET` | `/v1/index/status` | Report canonical/registry/index consistency state. | Ops, local dev, maintenance jobs | Control-plane endpoint. |
+| `POST` | `/v1/index/sync` | Repair drift between canonical files, registry, and passive index. | Ops, startup hooks, maintenance jobs | Incremental repair path. |
+| `POST` | `/v1/index/rebuild` | Rebuild the passive index from canonical records. | Ops, maintenance jobs | Full rebuild path. |
 
 Index behavior is aligned with the current Cosmic architecture:
 
