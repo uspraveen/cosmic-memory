@@ -4,6 +4,19 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from cosmic_memory.control_surface import (
+    CurrentStateRequest,
+    CurrentStateResponse,
+    MemoryBriefRequest,
+    MemoryBriefResponse,
+    MemoryQueryPlanRequest,
+    MemoryQueryPlanResponse,
+    ResolveIdentityRequest,
+    ResolveIdentityResponse,
+    SchemaContextResponse,
+    TemporalFactsRequest,
+    TemporalFactsResponse,
+)
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
     ActiveRecallResponse,
@@ -38,6 +51,18 @@ class MemoryService(Protocol):
     async def passive_recall(self, request: PassiveRecallRequest) -> PassiveRecallResponse: ...
 
     async def active_recall(self, request: ActiveRecallRequest) -> ActiveRecallResponse: ...
+
+    async def get_schema_context(self) -> SchemaContextResponse: ...
+
+    async def plan_query(self, request: MemoryQueryPlanRequest) -> MemoryQueryPlanResponse: ...
+
+    async def resolve_identity(self, request: ResolveIdentityRequest) -> ResolveIdentityResponse: ...
+
+    async def get_current_state(self, request: CurrentStateRequest) -> CurrentStateResponse: ...
+
+    async def get_temporal_facts(self, request: TemporalFactsRequest) -> TemporalFactsResponse: ...
+
+    async def build_memory_brief(self, request: MemoryBriefRequest) -> MemoryBriefResponse: ...
 
     async def get_index_status(self) -> IndexStatusResponse: ...
 

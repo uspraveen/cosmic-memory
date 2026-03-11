@@ -161,7 +161,8 @@ def build_active_response(
     entities: dict[str, GraphEntity] = {}
     relations: list[GraphRelation] = []
     for record, _ in matches:
-        for entity in record.metadata.get("entities", []):
+        graph_entities, graph_relations = _graph_metadata_from_record(record)
+        for entity in graph_entities:
             entity_id = entity.get("entity_id") or entity.get("name")
             if not entity_id:
                 continue
@@ -177,7 +178,7 @@ def build_active_response(
             elif record.memory_id not in existing.memory_ids:
                 existing.memory_ids.append(record.memory_id)
 
-        for relation in record.metadata.get("relations", []):
+        for relation in graph_relations:
             relations.append(
                 GraphRelation(
                     relation_id=relation.get(
@@ -203,6 +204,45 @@ def build_active_response(
         ],
         diagnostics=diagnostics,
     )
+
+
+def _graph_metadata_from_record(record: MemoryRecord) -> tuple[list[dict], list[dict]]:
+    graph_document = record.metadata.get("graph_document")
+    if graph_document:
+        entities_payload = graph_document.get("entities", []) or []
+        relations_payload = graph_document.get("relations", []) or []
+        entity_id_map: dict[str, str] = {}
+        normalized_entities: list[dict] = []
+        for entity in entities_payload:
+            local_ref = entity.get("local_ref") or entity.get("canonical_name") or "entity"
+            entity_id = f"{record.memory_id}:{local_ref}"
+            entity_id_map[local_ref] = entity_id
+            normalized_entities.append(
+                {
+                    "entity_id": entity_id,
+                    "name": entity.get("canonical_name", entity_id),
+                    "entity_type": entity.get("entity_type", "unknown"),
+                }
+            )
+        normalized_relations: list[dict] = []
+        for relation in relations_payload:
+            source_ref = relation.get("source_ref")
+            target_ref = relation.get("target_ref")
+            if not source_ref or not target_ref:
+                continue
+            normalized_relations.append(
+                {
+                    "relation_id": f"rel_{record.memory_id}_{len(normalized_relations)}",
+                    "source_entity_id": entity_id_map.get(source_ref, f"{record.memory_id}:{source_ref}"),
+                    "target_entity_id": entity_id_map.get(target_ref, f"{record.memory_id}:{target_ref}"),
+                    "relation_type": relation.get("relation_type", "mentions"),
+                    "fact": relation.get("fact", ""),
+                    "valid_at": relation.get("valid_at"),
+                    "invalid_at": relation.get("invalid_at"),
+                }
+            )
+        return normalized_entities, normalized_relations
+    return record.metadata.get("entities", []), record.metadata.get("relations", [])
 
 
 def build_active_response_with_graph(

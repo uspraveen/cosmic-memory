@@ -7,6 +7,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, status
 
+from cosmic_memory.control_surface import (
+    CurrentStateRequest,
+    MemoryBriefRequest,
+    MemoryQueryPlanRequest,
+    ResolveIdentityRequest,
+    TemporalFactsRequest,
+)
 from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
@@ -41,6 +48,8 @@ def create_app(
         await _close_if_present(getattr(app.state, "embedding_service", None))
         passive_index = getattr(getattr(app.state, "memory_service", None), "passive_index", None)
         await _close_if_present(passive_index)
+        graph_extractor = getattr(getattr(app.state, "memory_service", None), "graph_extractor", None)
+        await _close_if_present(graph_extractor)
         graph_store = getattr(getattr(app.state, "memory_service", None), "graph_store", None)
         await _close_if_present(graph_store)
 
@@ -94,6 +103,36 @@ def create_app(
     async def active_recall(payload: ActiveRecallRequest, request: Request):
         svc: MemoryService = request.app.state.memory_service
         return await svc.active_recall(payload)
+
+    @app.get("/v1/agent/schema-context")
+    async def get_schema_context(request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_schema_context()
+
+    @app.post("/v1/agent/plan")
+    async def plan_query(payload: MemoryQueryPlanRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.plan_query(payload)
+
+    @app.post("/v1/agent/resolve-identity")
+    async def resolve_identity(payload: ResolveIdentityRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.resolve_identity(payload)
+
+    @app.post("/v1/agent/current-state")
+    async def current_state(payload: CurrentStateRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_current_state(payload)
+
+    @app.post("/v1/agent/temporal-facts")
+    async def temporal_facts(payload: TemporalFactsRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_temporal_facts(payload)
+
+    @app.post("/v1/agent/memory-brief")
+    async def memory_brief(payload: MemoryBriefRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.build_memory_brief(payload)
 
     @app.get("/v1/index/status")
     async def get_index_status(request: Request):

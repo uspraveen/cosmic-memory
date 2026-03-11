@@ -47,6 +47,8 @@ The current milestone in this repo provides:
 - write-time xAI graph extraction with structured output support,
 - document-level graph dedup normalization before graph ingest,
 - graph-assisted passive recall and graph-first active recall when a graph store is attached,
+- a compact agent/orchestrator memory control surface,
+- schema injection, query planning, identity resolution, current-state lookup, temporal fact lookup, and structured memory briefs,
 - a thin FastAPI server,
 - an in-memory development implementation for contract testing.
 
@@ -58,6 +60,7 @@ That gives us a real shape for the system before wiring in:
 
 ```text
 src/cosmic_memory/
+  control_surface.py # agent/orchestrator-facing memory control surface
   core_facts.py # deterministic always-on profile block helpers
   domain/      # schemas, enums, contracts
   embeddings/  # dense embedding services
@@ -168,6 +171,12 @@ Current server endpoints:
 - `GET /v1/core-facts`
 - `POST /v1/query/passive`
 - `POST /v1/query/active`
+- `GET /v1/agent/schema-context`
+- `POST /v1/agent/plan`
+- `POST /v1/agent/resolve-identity`
+- `POST /v1/agent/current-state`
+- `POST /v1/agent/temporal-facts`
+- `POST /v1/agent/memory-brief`
 - `GET /v1/index/status`
 - `POST /v1/index/sync`
 - `POST /v1/index/rebuild`
@@ -180,9 +189,31 @@ Index behavior is aligned with the current Cosmic architecture:
 - startup sync can repair registry/index drift from canonical files,
 - passive recall enforces a fixed token budget before returning memories.
 
+## Agent Control Surface
+
+The agent-facing API is intentionally small. It is not meant to expose raw graph
+or index internals; it is meant to give the orchestrator stable memory
+primitives:
+
+- `schema_context`
+  - inject ontology, memory kinds, relation types, and tool guidance before complex planning
+- `plan`
+  - convert a user/task query into a memory search plan with recommended mode and tool sequence
+- `resolve_identity`
+  - normalize exact keys like email or username before traversal
+- `current_state`
+  - return active facts such as blockers, owners, reminders, preferences, and current work
+- `temporal_facts`
+  - return time-aware facts for before/after/when/history questions
+- `memory_brief`
+  - bundle passive recall, active recall, current/temporal facts, and distilled findings for the orchestrator
+
+This keeps memory reasoning inside `cosmic-memory` instead of forcing every
+agent to relearn the ontology, traversal strategy, and ranking heuristics.
+
 ## Near-Term Plan
 
 1. Integrate passive recall with Cosmic Gateway session assembly.
-2. Add active query-planning tools for orchestrator-driven memory surfing.
+2. Wire the new control surface into Gateway and orchestrator memory tooling.
 3. Add consolidation and conflict-resolution jobs.
-4. Expose agent-facing memory APIs for traversal and maintenance.
+4. Add extraction queues, caches, and production observability.

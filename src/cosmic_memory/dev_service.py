@@ -6,6 +6,27 @@ import asyncio
 import logging
 from time import perf_counter
 
+from cosmic_memory.control_surface import (
+    CurrentStateRequest,
+    CurrentStateResponse,
+    MemoryBriefRequest,
+    MemoryBriefResponse,
+    MemoryQueryPlanRequest,
+    MemoryQueryPlanResponse,
+    ResolveIdentityCandidate,
+    ResolveIdentityRequest,
+    ResolveIdentityResponse,
+    ResolvedEntityRef,
+    SchemaContextResponse,
+    TemporalFactsRequest,
+    TemporalFactsResponse,
+    build_brief_findings,
+    build_memory_query_plan,
+    build_schema_context,
+    filter_current_state_facts,
+    filter_temporal_facts,
+    graph_facts_from_active_response,
+)
 from cosmic_memory.core_facts import build_core_fact_block, find_active_core_fact_by_key
 from cosmic_memory.domain.enums import RecordStatus
 from cosmic_memory.domain.models import (
@@ -300,6 +321,207 @@ class InMemoryDevelopmentMemoryService:
             response,
             diagnostics=diagnostics,
             started_at=service_started,
+        )
+
+    async def get_schema_context(self) -> SchemaContextResponse:
+        return build_schema_context(graph_available=self.graph_store is not None)
+
+    async def plan_query(self, request: MemoryQueryPlanRequest) -> MemoryQueryPlanResponse:
+        return build_memory_query_plan(request, graph_available=self.graph_store is not None)
+
+    async def resolve_identity(self, request: ResolveIdentityRequest) -> ResolveIdentityResponse:
+        from cosmic_memory.graph import GraphIdentityCandidate, IdentityKeyType, build_identity_key
+
+        candidate = GraphIdentityCandidate(
+            key_type=IdentityKeyType(request.key_type),
+            raw_value=request.value,
+            provider=request.provider,
+            verified=request.verified,
+            confidence=request.confidence,
+        )
+        key = build_identity_key(candidate)
+        if self.graph_store is None:
+            return ResolveIdentityResponse(
+                graph_available=False,
+                status="no_match",
+                normalized_key_id=key.key_id,
+                normalized_value=key.normalized_value,
+            )
+
+        resolution = await self.graph_store.resolve_identity(candidate)
+        entity = None
+        if resolution.entity_id is not None:
+            resolved = await self.graph_store.get_entity(resolution.entity_id)
+            if resolved is not None:
+                entity = ResolvedEntityRef(
+                    entity_id=resolved.entity_id,
+                    name=resolved.canonical_name,
+                    entity_type=resolved.entity_type.value,
+                    memory_ids=resolved.memory_ids,
+                )
+        candidates: list[ResolveIdentityCandidate] = []
+        for item in resolution.candidates:
+            resolved = await self.graph_store.get_entity(item.entity_id)
+            candidates.append(
+                ResolveIdentityCandidate(
+                    entity_id=item.entity_id,
+                    reason=item.reason,
+                    confidence=item.confidence,
+                    name=resolved.canonical_name if resolved is not None else None,
+                    entity_type=resolved.entity_type.value if resolved is not None else None,
+                )
+            )
+        return ResolveIdentityResponse(
+            graph_available=True,
+            status=resolution.status,
+            normalized_key_id=key.key_id,
+            normalized_value=key.normalized_value,
+            entity=entity,
+            candidates=candidates,
+        )
+
+    async def get_current_state(self, request: CurrentStateRequest) -> CurrentStateResponse:
+        query = request.query
+        if "current" not in query.lower() and "active" not in query.lower() and "now" not in query.lower():
+            query = f"{query} current active now"
+        active = await self.active_recall(
+            ActiveRecallRequest(
+                query=query,
+                max_results=request.max_results,
+                max_hops=request.max_hops,
+                include_diagnostics=request.include_diagnostics,
+            )
+        )
+        facts = filter_current_state_facts(graph_facts_from_active_response(active))
+        supporting_ids = {memory_id for fact in facts for memory_id in fact.memory_ids}
+        supporting_memories = (
+            [item for item in active.items if not supporting_ids or item.memory_id in supporting_ids]
+            if request.include_supporting_memories
+            else []
+        )
+        return CurrentStateResponse(
+            query=request.query,
+            facts=facts[: request.max_results],
+            entities=active.entities,
+            supporting_memories=supporting_memories[: request.max_results],
+            search_plan=[*active.search_plan, "filter relations to current-state facts"],
+            diagnostics=active.diagnostics.model_dump(mode="json") if active.diagnostics else None,
+        )
+
+    async def get_temporal_facts(self, request: TemporalFactsRequest) -> TemporalFactsResponse:
+        query = request.query
+        temporal_terms = {"before", "after", "when", "last", "history", "timeline", "during"}
+        if not any(term in query.lower() for term in temporal_terms):
+            query = f"{query} before after when last timeline"
+        active = await self.active_recall(
+            ActiveRecallRequest(
+                query=query,
+                max_results=request.max_results,
+                max_hops=request.max_hops,
+                include_diagnostics=request.include_diagnostics,
+            )
+        )
+        facts = filter_temporal_facts(graph_facts_from_active_response(active))
+        supporting_ids = {memory_id for fact in facts for memory_id in fact.memory_ids}
+        supporting_memories = (
+            [item for item in active.items if not supporting_ids or item.memory_id in supporting_ids]
+            if request.include_supporting_memories
+            else []
+        )
+        return TemporalFactsResponse(
+            query=request.query,
+            facts=facts[: request.max_results],
+            entities=active.entities,
+            supporting_memories=supporting_memories[: request.max_results],
+            search_plan=[*active.search_plan, "filter relations to temporal facts"],
+            diagnostics=active.diagnostics.model_dump(mode="json") if active.diagnostics else None,
+        )
+
+    async def build_memory_brief(self, request: MemoryBriefRequest) -> MemoryBriefResponse:
+        plan = build_memory_query_plan(
+            MemoryQueryPlanRequest(query=request.query, max_hops=request.max_hops),
+            graph_available=self.graph_store is not None,
+        )
+        passive_task = asyncio.create_task(
+            self.passive_recall(
+                PassiveRecallRequest(
+                    query=request.query,
+                    max_results=request.passive_max_results,
+                    token_budget=request.token_budget,
+                    include_diagnostics=request.include_diagnostics,
+                )
+            )
+        )
+        active_task = None
+        current_task = None
+        temporal_task = None
+        core_fact_task = None
+        if plan.recommended_mode in {"active", "hybrid"}:
+            active_task = asyncio.create_task(
+                self.active_recall(
+                    ActiveRecallRequest(
+                        query=request.query,
+                        max_results=request.active_max_results,
+                        max_hops=plan.suggested_max_hops,
+                        include_diagnostics=request.include_diagnostics,
+                    )
+                )
+            )
+        if any(tool == "current_state" for tool in plan.tool_sequence):
+            current_task = asyncio.create_task(
+                self.get_current_state(
+                    CurrentStateRequest(
+                        query=request.query,
+                        max_results=request.active_max_results,
+                        max_hops=plan.suggested_max_hops,
+                        include_supporting_memories=True,
+                        include_diagnostics=request.include_diagnostics,
+                    )
+                )
+            )
+        if any(tool == "temporal_facts" for tool in plan.tool_sequence):
+            temporal_task = asyncio.create_task(
+                self.get_temporal_facts(
+                    TemporalFactsRequest(
+                        query=request.query,
+                        max_results=request.active_max_results,
+                        max_hops=plan.suggested_max_hops,
+                        include_supporting_memories=True,
+                        include_diagnostics=request.include_diagnostics,
+                    )
+                )
+            )
+        if request.include_core_facts:
+            core_fact_task = asyncio.create_task(self.build_core_fact_block(limit=8, max_chars=2_500))
+
+        passive = await passive_task
+        active = await active_task if active_task is not None else None
+        current_state = await current_task if current_task is not None else None
+        temporal = await temporal_task if temporal_task is not None else None
+        core_facts = await core_fact_task if core_fact_task is not None else None
+        findings = build_brief_findings(
+            current_state=current_state,
+            temporal=temporal,
+            active=active,
+            passive=passive,
+        )
+        supporting_memory_ids = sorted(
+            {
+                *(item.memory_id for item in passive.items),
+                *((item.memory_id for item in active.items) if active is not None else ()),
+                *((memory_id for fact in current_state.facts for memory_id in fact.memory_ids) if current_state else ()),
+                *((memory_id for fact in temporal.facts for memory_id in fact.memory_ids) if temporal else ()),
+            }
+        )
+        return MemoryBriefResponse(
+            plan=plan,
+            core_facts=core_facts,
+            passive=passive,
+            active=active,
+            current_state=current_state,
+            temporal=temporal,
+            findings=findings,
+            supporting_memory_ids=supporting_memory_ids,
         )
 
     async def get_index_status(self) -> IndexStatusResponse:

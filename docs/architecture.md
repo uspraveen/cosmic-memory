@@ -198,8 +198,18 @@ The memory layer should expose:
 - generate embeddings,
 - passive recall,
 - active recall,
-- ingest episode,
+- agent-facing memory control primitives:
+  - schema context,
+  - query planning,
+  - identity resolution,
+  - current-state lookup,
+  - temporal fact lookup,
+  - structured memory briefs,
 - health / rebuild / maintenance endpoints.
+
+These are not meant to be arbitrary helper endpoints. They are the typed memory
+control surface the orchestrator should use instead of generating raw Cypher or
+re-implementing memory heuristics in every agent.
 
 ## Why Library-First
 
@@ -245,8 +255,9 @@ The current milestone in this repo now includes:
 - provide startup and on-demand index sync/rebuild workflows,
 - provide token-budget-aware passive recall with multi-factor reranking and budget packing,
 - provide batch and parallel request handling for embedding/index work.
+- provide an agent/orchestrator control surface for memory planning and graph-aware lookup.
 
 The next backend milestones are:
 
-- active query planning for orchestrator-driven traversal,
+- Gateway integration against the real session assembly path,
 - consolidation workflows.
