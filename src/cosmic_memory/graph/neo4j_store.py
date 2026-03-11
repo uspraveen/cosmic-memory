@@ -10,6 +10,7 @@ from datetime import datetime
 
 from cosmic_memory.domain.models import utc_now
 from cosmic_memory.graph.dev_store import InMemoryGraphStore
+from cosmic_memory.graph.entity_index import EntitySimilarityIndex, entity_similarity_text_parts
 from cosmic_memory.graph.identity import build_identity_key
 from cosmic_memory.graph.models import (
     GraphDocument,
@@ -23,7 +24,11 @@ from cosmic_memory.graph.models import (
     IdentityResolutionResult,
 )
 from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
-from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
+from cosmic_memory.graph.resolution import (
+    STRONG_KEY_TYPES,
+    entity_allows_name_auto_merge,
+    similarity_candidate_types,
+)
 
 
 class Neo4jGraphStore:
@@ -42,6 +47,7 @@ class Neo4jGraphStore:
         username: str,
         password: str,
         database: str = "neo4j",
+        entity_index: EntitySimilarityIndex | None = None,
     ) -> None:
         try:
             from neo4j import AsyncGraphDatabase
@@ -53,6 +59,7 @@ class Neo4jGraphStore:
 
         self.driver = AsyncGraphDatabase.driver(uri, auth=(username, password))
         self.database = database
+        self.entity_index = entity_index
         self._ready = False
         self._cache_lock = asyncio.Lock()
         self._search_cache: InMemoryGraphStore | None = None
@@ -62,6 +69,7 @@ class Neo4jGraphStore:
         async with self.driver.session(database=self.database) as session:
             ref_to_entity_id: dict[str, str] = {}
             resolution_events: list[IdentityResolutionResult] = []
+            changed_entities: dict[str, GraphEntityNode] = {}
 
             for entity in document.entities:
                 resolved_entity, events = await self._upsert_entity(
@@ -70,6 +78,7 @@ class Neo4jGraphStore:
                     document_entity=entity,
                 )
                 ref_to_entity_id[entity.local_ref] = resolved_entity.entity_id
+                changed_entities[resolved_entity.entity_id] = resolved_entity
                 resolution_events.extend(events)
 
             relation_ids: list[str] = []
@@ -98,11 +107,14 @@ class Neo4jGraphStore:
             relation_ids=sorted(set(relation_ids)),
             resolution_events=resolution_events,
         )
+        if self.entity_index is not None and changed_entities:
+            await self.entity_index.sync_entities(list(changed_entities.values()))
         await self._cache_ingest_document(document)
         return result
 
     async def remove_memory(self, memory_id: str) -> None:
         await self._ensure_ready()
+        touched_entity_ids: set[str] = set()
         async with self.driver.session(database=self.database) as session:
             result = await session.run(
                 """
@@ -165,7 +177,22 @@ class Neo4jGraphStore:
                             """,
                             node_id=row["node_id"],
                         )
+                    if label == "Entity":
+                        touched_entity_ids.add(row["node_id"])
         await self._cache_remove_memory(memory_id)
+        if self.entity_index is not None and touched_entity_ids:
+            entities_to_sync: list[GraphEntityNode] = []
+            entities_to_delete: list[str] = []
+            for entity_id in touched_entity_ids:
+                entity = await self.get_entity(entity_id)
+                if entity is None or not entity.memory_ids:
+                    entities_to_delete.append(entity_id)
+                    continue
+                entities_to_sync.append(entity)
+            if entities_to_delete:
+                await self.entity_index.delete_entities(entities_to_delete)
+            if entities_to_sync:
+                await self.entity_index.sync_entities(entities_to_sync)
 
     async def resolve_identity(
         self, candidate: GraphIdentityCandidate
@@ -248,6 +275,8 @@ class Neo4jGraphStore:
         return _entity_from_props(dict(row["e"]))
 
     async def close(self) -> None:
+        if self.entity_index is not None:
+            await self.entity_index.close()
         await self.driver.close()
 
     async def _ensure_ready(self) -> None:
@@ -344,6 +373,57 @@ class Neo4jGraphStore:
                     ],
                 )
             )
+        elif self.entity_index is not None:
+            similarity_hits = await self.entity_index.search(
+                entity_similarity_text_parts(
+                    entity_type=document_entity.entity_type,
+                    canonical_name=document_entity.canonical_name,
+                    alias_values=document_entity.alias_values,
+                    attributes=document_entity.attributes,
+                ),
+                entity_types=sorted(
+                    similarity_candidate_types(document_entity.entity_type),
+                    key=lambda value: value.value,
+                ),
+                limit=5,
+            )
+            auto_merge_hits = [hit for hit in similarity_hits if hit.score >= 0.92]
+            candidate_hits = [hit for hit in similarity_hits if 0.78 <= hit.score < 0.92]
+            if auto_merge_hits:
+                entity_id = auto_merge_hits[0].entity_id
+                resolved_entity = await self.get_entity(entity_id)
+                if resolved_entity is None:
+                    resolved_entity = _new_entity(memory_id, document_entity, provisional=False)
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="exact_match",
+                        entity_id=resolved_entity.entity_id,
+                    )
+                )
+            elif candidate_hits:
+                resolved_entity = _new_entity(memory_id, document_entity, provisional=True)
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="candidate_match",
+                        entity_id=resolved_entity.entity_id,
+                        candidates=[
+                            IdentityResolutionCandidate(
+                                entity_id=hit.entity_id,
+                                reason="entity_similarity_candidate",
+                                confidence=min(max(hit.score, 0.0), 1.0),
+                            )
+                            for hit in candidate_hits
+                        ],
+                    )
+                )
+            else:
+                resolved_entity = _new_entity(memory_id, document_entity, provisional=False)
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="created_new",
+                        entity_id=resolved_entity.entity_id,
+                    )
+                )
         else:
             resolved_entity = _new_entity(memory_id, document_entity, provisional=False)
             resolution_events.append(
@@ -553,7 +633,7 @@ class Neo4jGraphStore:
             return store
 
     async def _hydrate_search_store(self) -> InMemoryGraphStore:
-        store = InMemoryGraphStore()
+        store = InMemoryGraphStore(entity_index=self.entity_index)
         async with self.driver.session(database=self.database) as session:
             entity_result = await session.run(
                 """

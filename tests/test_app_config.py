@@ -3,6 +3,7 @@ import pytest
 from cosmic_memory.embeddings.hash import HashEmbeddingService
 from cosmic_memory.server.app import (
     _build_embedding_service_from_env,
+    _build_entity_index_from_env,
     _build_graph_extractor_from_env,
     _build_graph_store_from_env,
     _build_passive_index_from_env,
@@ -33,34 +34,63 @@ def test_build_graph_store_requires_neo4j_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("COSMIC_MEMORY_NEO4J_PASSWORD", raising=False)
 
     with pytest.raises(RuntimeError):
-        _build_graph_store_from_env()
+        _build_graph_store_from_env(HashEmbeddingService(dimensions=32))
 
 
 def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, str] = {}
 
     class FakeNeo4jGraphStore:
-        def __init__(self, *, uri: str, username: str, password: str, database: str) -> None:
+        def __init__(
+            self,
+            *,
+            uri: str,
+            username: str,
+            password: str,
+            database: str,
+            entity_index,
+        ) -> None:
             captured["uri"] = uri
             captured["username"] = username
             captured["password"] = password
             captured["database"] = database
+            captured["entity_index"] = entity_index
 
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
+    monkeypatch.setenv("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "false")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_URI", "bolt://localhost:7687")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_USERNAME", "neo4j")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_PASSWORD", "secret")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_DATABASE", "neo4j")
     monkeypatch.setattr("cosmic_memory.server.app.Neo4jGraphStore", FakeNeo4jGraphStore)
 
-    _build_graph_store_from_env()
+    _build_graph_store_from_env(HashEmbeddingService(dimensions=32))
 
     assert captured == {
         "uri": "bolt://localhost:7687",
         "username": "neo4j",
         "password": "secret",
         "database": "neo4j",
+        "entity_index": None,
     }
+
+
+def test_build_entity_index_can_construct_qdrant_backend(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeEntityIndex:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "true")
+    monkeypatch.setenv("COSMIC_MEMORY_QDRANT_PATH", "/tmp/qdrant")
+    monkeypatch.setattr("cosmic_memory.server.app.QdrantEntitySimilarityIndex", FakeEntityIndex)
+
+    _build_entity_index_from_env(HashEmbeddingService(dimensions=32))
+
+    assert captured["collection_name"] == "memory_entities"
+    assert captured["path"] == "/tmp/qdrant"
+    assert captured["vector_size"] == 32
 
 
 def test_build_graph_extractor_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

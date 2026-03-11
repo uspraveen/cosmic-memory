@@ -2,6 +2,12 @@
 
 from cosmic_memory.graph.base import GraphStore
 from cosmic_memory.graph.dev_store import InMemoryGraphStore
+from cosmic_memory.graph.entity_index import (
+    EntitySimilarityHit,
+    EntitySimilarityIndex,
+    InMemoryEntitySimilarityIndex,
+)
+from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.graph.identity import (
     build_identity_key,
     deterministic_identity_key_id,
@@ -34,6 +40,8 @@ from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_
 
 __all__ = [
     "EntityType",
+    "EntitySimilarityHit",
+    "EntitySimilarityIndex",
     "GraphDocument",
     "GraphDocumentEntity",
     "GraphDocumentRelation",
@@ -48,7 +56,9 @@ __all__ = [
     "IdentityKeyType",
     "IdentityResolutionResult",
     "InMemoryGraphStore",
+    "InMemoryEntitySimilarityIndex",
     "QueryIntent",
+    "QdrantEntitySimilarityIndex",
     "RelationType",
     "Neo4jGraphStore",
     "build_identity_key",

@@ -7,6 +7,7 @@ import re
 from collections import defaultdict, deque
 
 from cosmic_memory.domain.models import utc_now
+from cosmic_memory.graph.entity_index import EntitySimilarityIndex, entity_similarity_text_parts
 from cosmic_memory.graph.identity import build_identity_key
 from cosmic_memory.graph.models import (
     GraphDocument,
@@ -21,26 +22,33 @@ from cosmic_memory.graph.models import (
     IdentityResolutionResult,
 )
 from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
-from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
+from cosmic_memory.graph.resolution import (
+    STRONG_KEY_TYPES,
+    entity_allows_name_auto_merge,
+    similarity_candidate_types,
+)
 
 
 class InMemoryGraphStore:
     """Small in-memory graph store with strict identity merge rules."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, entity_index: EntitySimilarityIndex | None = None) -> None:
         self._entities: dict[str, GraphEntityNode] = {}
         self._identity_keys: dict[str, GraphIdentityKey] = {}
         self._entity_to_relations: dict[str, set[str]] = defaultdict(set)
         self._relations: dict[str, GraphRelationEdge] = {}
         self._key_to_entities: dict[str, set[str]] = defaultdict(set)
+        self.entity_index = entity_index
 
     async def ingest_document(self, document: GraphDocument) -> GraphIngestResult:
         ref_to_entity_id: dict[str, str] = {}
         resolution_events: list[IdentityResolutionResult] = []
+        changed_entity_ids: set[str] = set()
 
         for entity in document.entities:
-            resolved_entity, events = self._upsert_entity(document.memory_id, entity)
+            resolved_entity, events = await self._upsert_entity(document.memory_id, entity)
             ref_to_entity_id[entity.local_ref] = resolved_entity.entity_id
+            changed_entity_ids.add(resolved_entity.entity_id)
             resolution_events.extend(events)
 
         relation_ids: list[str] = []
@@ -61,6 +69,11 @@ class InMemoryGraphStore:
                 expires_at=relation.expires_at,
             )
             relation_ids.append(edge.relation_id)
+
+        if self.entity_index is not None and changed_entity_ids:
+            await self.entity_index.sync_entities(
+                [self._entities[entity_id] for entity_id in changed_entity_ids if entity_id in self._entities]
+            )
 
         return GraphIngestResult(
             memory_id=document.memory_id,
@@ -93,6 +106,7 @@ class InMemoryGraphStore:
 
     async def remove_memory(self, memory_id: str) -> None:
         relation_ids_to_delete: list[str] = []
+        touched_entity_ids: set[str] = set()
         for relation_id, relation in self._relations.items():
             if memory_id not in relation.memory_ids:
                 continue
@@ -110,10 +124,19 @@ class InMemoryGraphStore:
         for entity in self._entities.values():
             if memory_id in entity.memory_ids:
                 entity.memory_ids = [value for value in entity.memory_ids if value != memory_id]
+                touched_entity_ids.add(entity.entity_id)
 
         for key in self._identity_keys.values():
             if memory_id in key.memory_ids:
                 key.memory_ids = [value for value in key.memory_ids if value != memory_id]
+
+        if self.entity_index is not None:
+            await self.entity_index.delete_entities(
+                [entity_id for entity_id in touched_entity_ids if entity_id in self._entities and not self._entities[entity_id].memory_ids]
+            )
+            await self.entity_index.sync_entities(
+                [self._entities[entity_id] for entity_id in touched_entity_ids if entity_id in self._entities and self._entities[entity_id].memory_ids]
+            )
 
     async def passive_search(
         self,
@@ -122,7 +145,7 @@ class InMemoryGraphStore:
         max_entities: int = 5,
         max_relations: int = 8,
     ) -> GraphSearchResult:
-        seed_entity_ids = self._seed_entities(query_frame)
+        seed_entity_ids = await self._seed_entities(query_frame)
         relation_hits = self._rank_relations(
             query_frame,
             seed_entity_ids=seed_entity_ids,
@@ -158,7 +181,7 @@ class InMemoryGraphStore:
         max_entities: int = 10,
         max_relations: int = 12,
     ) -> GraphSearchResult:
-        seeds = seed_entity_ids or self._seed_entities(query_frame)
+        seeds = seed_entity_ids or await self._seed_entities(query_frame)
         relation_hits = self._rank_relations(
             query_frame,
             seed_entity_ids=seeds,
@@ -188,7 +211,7 @@ class InMemoryGraphStore:
     async def get_entity(self, entity_id: str) -> GraphEntityNode | None:
         return self._entities.get(entity_id)
 
-    def _upsert_entity(self, memory_id: str, entity) -> tuple[GraphEntityNode, list[IdentityResolutionResult]]:
+    async def _upsert_entity(self, memory_id: str, entity) -> tuple[GraphEntityNode, list[IdentityResolutionResult]]:
         identity_candidates = list(entity.identity_candidates)
         for raw_value in [entity.canonical_name, *entity.alias_values]:
             identity_candidates.append(
@@ -267,6 +290,51 @@ class InMemoryGraphStore:
                     ],
                 )
             )
+        elif self.entity_index is not None:
+            similarity_hits = await self.entity_index.search(
+                entity_similarity_text_parts(
+                    entity_type=entity.entity_type,
+                    canonical_name=entity.canonical_name,
+                    alias_values=entity.alias_values,
+                    attributes=entity.attributes,
+                ),
+                entity_types=sorted(similarity_candidate_types(entity.entity_type), key=lambda value: value.value),
+                limit=5,
+            )
+            auto_merge_hits = [hit for hit in similarity_hits if hit.score >= 0.92]
+            candidate_hits = [hit for hit in similarity_hits if 0.78 <= hit.score < 0.92]
+            if auto_merge_hits:
+                resolved_entity = self._entities[auto_merge_hits[0].entity_id]
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="exact_match",
+                        entity_id=resolved_entity.entity_id,
+                    )
+                )
+            elif candidate_hits:
+                resolved_entity = self._create_entity(memory_id, entity, provisional=True)
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="candidate_match",
+                        entity_id=resolved_entity.entity_id,
+                        candidates=[
+                            IdentityResolutionCandidate(
+                                entity_id=hit.entity_id,
+                                reason="entity_similarity_candidate",
+                                confidence=min(max(hit.score, 0.0), 1.0),
+                            )
+                            for hit in candidate_hits
+                        ],
+                    )
+                )
+            else:
+                resolved_entity = self._create_entity(memory_id, entity, provisional=False)
+                resolution_events.append(
+                    IdentityResolutionResult(
+                        status="created_new",
+                        entity_id=resolved_entity.entity_id,
+                    )
+                )
         else:
             resolved_entity = self._create_entity(memory_id, entity, provisional=False)
             resolution_events.append(
@@ -377,7 +445,7 @@ class InMemoryGraphStore:
         self._entity_to_relations[target_entity_id].add(relation_id)
         return edge
 
-    def _seed_entities(self, query_frame: GraphQueryFrame) -> list[str]:
+    async def _seed_entities(self, query_frame: GraphQueryFrame) -> list[str]:
         exact_entity_ids: set[str] = set()
         for candidate in query_frame.identity_candidates:
             exact_entity_ids.update(self._resolve_exact_entity_ids(candidate))
@@ -385,16 +453,19 @@ class InMemoryGraphStore:
         if exact_entity_ids:
             return sorted(exact_entity_ids)
 
-        ranked = sorted(
-            self._entities.values(),
-            key=lambda entity: self._score_entity(query_frame, entity),
-            reverse=True,
-        )
-        return [
-            entity.entity_id
-            for entity in ranked[:3]
-            if self._score_entity(query_frame, entity) > 0
-        ]
+        score_map: dict[str, float] = {}
+        for entity in self._entities.values():
+            lexical_score = self._score_entity(query_frame, entity)
+            if lexical_score > 0:
+                score_map[entity.entity_id] = max(score_map.get(entity.entity_id, 0.0), lexical_score)
+
+        if self.entity_index is not None:
+            similarity_hits = await self.entity_index.search(query_frame.query, limit=6)
+            for hit in similarity_hits:
+                score_map[hit.entity_id] = max(score_map.get(hit.entity_id, 0.0), hit.score * 0.85)
+
+        ranked_entity_ids = sorted(score_map, key=lambda entity_id: score_map[entity_id], reverse=True)
+        return [entity_id for entity_id in ranked_entity_ids[:3] if score_map[entity_id] > 0]
 
     def _resolve_exact_entity_ids(self, candidate: GraphIdentityCandidate) -> set[str]:
         try:
@@ -510,6 +581,10 @@ class InMemoryGraphStore:
         payload = "||".join([memory_id, source_entity_id, target_entity_id, relation_type.value, fact])
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         return f"rel_{digest[:24]}"
+
+    async def close(self) -> None:
+        if self.entity_index is not None:
+            await self.entity_index.close()
 
 
 def _tokenize(text: str) -> set[str]:

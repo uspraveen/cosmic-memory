@@ -46,6 +46,7 @@ The current milestone in this repo provides:
 - graph ontology and deterministic identity normalization foundations,
 - write-time xAI graph extraction with structured output support,
 - document-level graph dedup normalization before graph ingest,
+- a dedicated entity-similarity index for entity candidate generation and graph seeding,
 - graph-assisted passive recall and graph-first active recall when a graph store is attached,
 - a compact agent/orchestrator memory control surface,
 - schema injection, query planning, identity resolution, current-state lookup, temporal fact lookup, and structured memory briefs,
@@ -64,6 +65,8 @@ src/cosmic_memory/
   core_facts.py # deterministic always-on profile block helpers
   domain/      # schemas, enums, contracts
   embeddings/  # dense embedding services
+  extraction/  # graph extraction and normalization
+  graph/       # ontology, identity resolution, traversal, entity similarity
   index/       # passive recall index adapters
   storage/     # canonical markdown + sqlite registry
   server/      # FastAPI wrapper
@@ -113,6 +116,8 @@ Relevant environment variables:
 - `COSMIC_MEMORY_QDRANT_COLLECTION` (default `memories`)
 - `COSMIC_MEMORY_SPARSE_MODEL` (default `Qdrant/bm25`)
 - `COSMIC_MEMORY_SPARSE_BACKEND` (`auto`, `native`, `fastembed`, or `simple`; default `auto`)
+- `COSMIC_MEMORY_ENTITY_INDEX_ENABLED` (default `true`)
+- `COSMIC_MEMORY_ENTITY_COLLECTION` (default `memory_entities`)
 - `COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS` (default `120`)
 - `COSMIC_MEMORY_SYNC_ON_STARTUP` or `MEMORY_SYNC_ON_STARTUP` (default `true`)
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)
@@ -147,8 +152,12 @@ Graph notes:
 - exact strong keys such as email auto-link entities,
 - weak alias keys do not auto-merge by themselves,
 - non-person entities such as `project`, `task`, and `organization` can auto-merge by exact normalized name,
+- entity similarity uses a separate Qdrant collection and the same Perplexity embedding model as passive memory,
+- vector similarity is only used for shortlist generation after exact identity and normalized-name checks,
+- ambiguous similarity hits become provisional `candidate_match` results instead of silent auto-merges,
 - write-time extraction stores normalized `graph_document` payloads back into canonical Markdown,
 - extraction prompts are explicitly time-aware and resolve relative dates against UTC and local timezone anchors,
+- passive graph seeding can use the entity-similarity index to resolve indirect references like `todo` -> `task`,
 - current graph backend support in the app factory is intentionally limited to:
   - `memory` for local/dev validation
   - `neo4j` as the first persistent backend boundary

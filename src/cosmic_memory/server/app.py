@@ -29,6 +29,8 @@ from cosmic_memory.env import load_env_file
 from cosmic_memory.extraction import XAIGraphExtractionService
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
+from cosmic_memory.graph.entity_index import InMemoryEntitySimilarityIndex
+from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
 from cosmic_memory.service import MemoryService
 
@@ -165,9 +167,14 @@ def create_default_app() -> FastAPI:
 
 
 def create_development_app() -> FastAPI:
+    embedding_service = HashEmbeddingService()
     return create_app(
-        InMemoryDevelopmentMemoryService(graph_store=InMemoryGraphStore()),
-        embedding_service=HashEmbeddingService(),
+        InMemoryDevelopmentMemoryService(
+            graph_store=InMemoryGraphStore(
+                entity_index=InMemoryEntitySimilarityIndex(embedding_service=embedding_service)
+            )
+        ),
+        embedding_service=embedding_service,
     )
 
 
@@ -179,7 +186,10 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
         embedding_service,
         default_path=str(Path(data_root) / "qdrant_data"),
     )
-    graph_store = _build_graph_store_from_env()
+    graph_store = _build_graph_store_from_env(
+        embedding_service,
+        default_path=str(Path(data_root) / "qdrant_data"),
+    )
     graph_extractor = _build_graph_extractor_from_env()
     return create_app(
         FilesystemMemoryService(
@@ -284,12 +294,20 @@ def _sync_on_startup_enabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _build_graph_store_from_env():
+def _build_graph_store_from_env(
+    embedding_service: EmbeddingService,
+    *,
+    default_path: str | None = None,
+):
     backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
     if backend in {"", "none", "off"}:
         return None
+    entity_index = _build_entity_index_from_env(
+        embedding_service,
+        default_path=default_path,
+    )
     if backend == "memory":
-        return InMemoryGraphStore()
+        return InMemoryGraphStore(entity_index=entity_index)
     if backend == "neo4j":
         uri = os.environ.get("COSMIC_MEMORY_NEO4J_URI")
         username = os.environ.get("COSMIC_MEMORY_NEO4J_USERNAME")
@@ -306,10 +324,37 @@ def _build_graph_store_from_env():
             username=username,
             password=password,
             database=database,
+            entity_index=entity_index,
         )
     raise RuntimeError(
         f"Unsupported graph backend: {backend}. "
         "Supported values are `none`, `memory`, and `neo4j`."
+    )
+
+
+def _build_entity_index_from_env(
+    embedding_service: EmbeddingService,
+    *,
+    default_path: str | None = None,
+):
+    enabled = os.environ.get("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+    qdrant_url = os.environ.get("COSMIC_MEMORY_QDRANT_URL")
+    qdrant_path = (
+        os.environ.get("COSMIC_MEMORY_QDRANT_PATH")
+        or os.environ.get("QDRANT_PATH")
+        or default_path
+    )
+    return QdrantEntitySimilarityIndex(
+        embedding_service=embedding_service,
+        collection_name=os.environ.get("COSMIC_MEMORY_ENTITY_COLLECTION", "memory_entities"),
+        vector_size=int(os.environ.get("COSMIC_MEMORY_VECTOR_SIZE", str(embedding_service.dimensions))),
+        url=qdrant_url,
+        path=qdrant_path,
+        embed_batch_size=int(os.environ.get("COSMIC_MEMORY_EMBED_BATCH_SIZE", "128")),
+        embed_parallel_requests=int(os.environ.get("COSMIC_MEMORY_EMBED_MAX_PARALLEL", "4")),
+        dense_encoding_format=os.environ.get("COSMIC_MEMORY_EMBED_ENCODING", "base64_int8"),
     )
 
 

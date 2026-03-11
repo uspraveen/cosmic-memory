@@ -1,5 +1,10 @@
 import asyncio
 
+from cosmic_memory.domain.models import (
+    EmbeddingItem,
+    GenerateEmbeddingsRequest,
+    GenerateEmbeddingsResponse,
+)
 from cosmic_memory.graph import (
     EntityType,
     GraphDocument,
@@ -7,10 +12,49 @@ from cosmic_memory.graph import (
     GraphDocumentRelation,
     GraphIdentityCandidate,
     IdentityKeyType,
+    InMemoryEntitySimilarityIndex,
     InMemoryGraphStore,
     RelationType,
     build_query_frame,
 )
+
+
+class SemanticTestEmbeddingService:
+    model_name = "semantic-test"
+    dimensions = 128
+
+    async def generate(self, request: GenerateEmbeddingsRequest) -> GenerateEmbeddingsResponse:
+        items: list[EmbeddingItem] = []
+        for index, text in enumerate(request.texts):
+            items.append(
+                EmbeddingItem(
+                    index=index,
+                    vector=self._embed(text),
+                    dimensions=self.dimensions,
+                )
+            )
+        return GenerateEmbeddingsResponse(
+            model=self.model_name,
+            dimensions=self.dimensions,
+            items=items,
+        )
+
+    async def close(self) -> None:
+        return None
+
+    def _embed(self, text: str) -> list[float]:
+        normalized = text.casefold()
+        vector = [0.0] * self.dimensions
+        if any(token in normalized for token in ("todo", "task", "tasks", "reminder", "goal")):
+            vector[0] += 1.0
+        if any(token in normalized for token in ("roadmap", "plan")):
+            vector[1] += 1.0
+        if any(token in normalized for token in ("block", "blocked", "blocker", "latency")):
+            vector[2] += 1.0
+        if all(value == 0.0 for value in vector):
+            vector[3] = 1.0
+        norm = sum(value * value for value in vector) ** 0.5
+        return [value / norm for value in vector]
 
 
 def test_graph_store_merges_same_email_into_one_person():
@@ -172,5 +216,87 @@ def test_graph_store_auto_merges_same_project_name_across_documents():
         assert len(first.entity_ids) == 1
         assert second.entity_ids == first.entity_ids
         assert second.resolution_events[0].status == "exact_match"
+
+    asyncio.run(run())
+
+
+def test_graph_store_uses_entity_similarity_for_merge_candidates():
+    async def run():
+        store = InMemoryGraphStore(
+            entity_index=InMemoryEntitySimilarityIndex(
+                embedding_service=SemanticTestEmbeddingService()
+            )
+        )
+        await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_similarity_1",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                        alias_values=["Roadmap action item"],
+                    )
+                ],
+            )
+        )
+        result = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_similarity_2",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="todo",
+                        entity_type=EntityType.REMINDER,
+                        canonical_name="Roadmap todo",
+                    )
+                ],
+            )
+        )
+
+        assert result.resolution_events[0].status == "candidate_match"
+        assert result.resolution_events[0].candidates
+        assert result.resolution_events[0].candidates[0].reason == "entity_similarity_candidate"
+
+    asyncio.run(run())
+
+
+def test_passive_search_can_seed_entities_from_entity_similarity():
+    async def run():
+        store = InMemoryGraphStore(
+            entity_index=InMemoryEntitySimilarityIndex(
+                embedding_service=SemanticTestEmbeddingService()
+            )
+        )
+        await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_similarity_rel",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="task",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Roadmap task is blocked by embedding latency.",
+                    )
+                ],
+            )
+        )
+
+        result = await store.passive_search(build_query_frame("What is the roadmap todo blocked by?"))
+
+        assert result.relations
+        assert result.relations[0].relation_type == RelationType.BLOCKED_BY
+        assert "mem_similarity_rel" in result.supporting_memory_ids
 
     asyncio.run(run())
