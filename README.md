@@ -28,6 +28,101 @@ Gateway still owns the current-day session store and conversation orchestration.
 `cosmic-memory` owns canonical long-term memory, retrieval contracts, and
 memory-layer operations.
 
+## Architecture
+
+### System Boundaries
+
+```mermaid
+flowchart LR
+    U[User Query] --> G[Cosmic Gateway]
+    G --> S[sessions.db<br/>live daily session]
+    G --> CM[cosmic-memory]
+
+    subgraph CMStack[cosmic-memory]
+        CF[core_fact block]
+        PR[Passive Recall]
+        AR[Active Agentic Memory]
+        CS[Agent Control Surface]
+        EXT[LLM Graph Extraction]
+        REG[SQLite Registry]
+        MD[Canonical Markdown]
+        Q[(Qdrant<br/>memory index)]
+        EQ[(Qdrant<br/>entity index)]
+        N[(Neo4j<br/>graph projection)]
+    end
+
+    CM --> CF
+    CM --> PR
+    CM --> AR
+    CM --> CS
+    EXT --> MD
+    MD <--> REG
+    MD --> Q
+    MD --> N
+    N --> EQ
+    PR --> Q
+    PR --> N
+    PR --> EQ
+    AR --> Q
+    AR --> N
+
+    CF --> G
+    PR --> G
+    CS --> G
+```
+
+### Write And Ingestion Flow
+
+```mermaid
+sequenceDiagram
+    participant GW as Gateway / Agent
+    participant CM as cosmic-memory
+    participant X as xAI Extractor
+    participant MD as Markdown Store
+    participant REG as SQLite Registry
+    participant G as Graph Store
+    participant EI as Entity Index
+    participant Q as Qdrant Memory Index
+
+    GW->>CM: write(memory)
+    CM->>MD: persist canonical .md record
+    CM->>REG: upsert registry snapshot
+    alt graph extraction enabled
+        CM->>X: extract entities / relations / time anchors
+        X-->>CM: graph_document
+        CM->>MD: write normalized graph metadata
+        CM->>G: ingest graph_document
+        G->>EI: sync changed entities
+    end
+    CM->>Q: upsert passive memory point
+    CM-->>GW: MemoryRecord + memory_id
+```
+
+### Passive And Active Retrieval
+
+```mermaid
+flowchart TD
+    QRY[Incoming query] --> CORE[Load core_fact block]
+    QRY --> PASS[Passive recall]
+
+    PASS --> MEMQ[Qdrant hybrid memory search]
+    PASS --> RERANK[Multi-factor reranking<br/>type + recency + identity + current-state + token cost]
+    PASS --> GSEED[Optional graph seed generation<br/>exact identities + entity similarity]
+    GSEED --> G1[Shallow graph assist<br/>1-hop, timeout bounded]
+    MEMQ --> RERANK
+    G1 --> RERANK
+    RERANK --> PACK[Token-budget packing]
+    PACK --> CTX[Prompt context for every LLM call]
+
+    QRY --> DECIDE{Need deep memory?}
+    DECIDE -->|Yes| ACTIVE[Active memory traversal]
+    ACTIVE --> PLAN[Agent/orchestrator memory plan]
+    PLAN --> TOOLS[resolve_identity / current_state / temporal_facts / traverse / memory_brief]
+    TOOLS --> GRAPH[Multi-hop graph + memory evidence]
+    GRAPH --> BRIEF[Structured memory brief]
+    DECIDE -->|No| CTX
+```
+
 ## Current Scope
 
 The current milestone in this repo provides:
