@@ -94,8 +94,25 @@ def test_build_entity_index_can_construct_qdrant_backend(monkeypatch: pytest.Mon
     _build_entity_index_from_env(HashEmbeddingService(dimensions=32))
 
     assert captured["collection_name"] == "memory_entities"
-    assert captured["path"] == "/tmp/qdrant"
+    assert str(captured["path"]).endswith("qdrant_entity_data")
     assert captured["vector_size"] == 32
+
+
+def test_build_entity_index_can_use_explicit_local_path(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeEntityIndex:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "true")
+    monkeypatch.setenv("COSMIC_MEMORY_QDRANT_PATH", "/tmp/qdrant")
+    monkeypatch.setenv("COSMIC_MEMORY_ENTITY_QDRANT_PATH", "/tmp/qdrant-entities")
+    monkeypatch.setattr("cosmic_memory.server.app.QdrantEntitySimilarityIndex", FakeEntityIndex)
+
+    _build_entity_index_from_env(HashEmbeddingService(dimensions=32))
+
+    assert captured["path"] == "/tmp/qdrant-entities"
 
 
 def test_build_graph_extractor_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

@@ -125,6 +125,7 @@ The planned storage split is:
   - separate Qdrant collection
   - same Perplexity embedding service as passive memory
   - used for entity merge candidates and graph query seeding
+  - in embedded local mode, uses a separate local Qdrant path from the passive index to avoid client lock conflicts
 - active traversal projection:
   - graph backend
 

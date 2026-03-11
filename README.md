@@ -219,6 +219,7 @@ Relevant environment variables:
 - `COSMIC_MEMORY_SPARSE_BACKEND` (`auto`, `native`, `fastembed`, or `simple`; default `auto`)
 - `COSMIC_MEMORY_ENTITY_INDEX_ENABLED` (default `true`)
 - `COSMIC_MEMORY_ENTITY_COLLECTION` (default `memory_entities`)
+- `COSMIC_MEMORY_ENTITY_QDRANT_PATH` (optional override for embedded local entity-index storage)
 - `COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS` (default `120`)
 - `COSMIC_MEMORY_SYNC_ON_STARTUP` or `MEMORY_SYNC_ON_STARTUP` (default `true`)
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)

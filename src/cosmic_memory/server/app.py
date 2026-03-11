@@ -347,11 +347,20 @@ def _build_entity_index_from_env(
     if enabled in {"0", "false", "no", "off"}:
         return None
     qdrant_url = os.environ.get("COSMIC_MEMORY_QDRANT_URL")
-    qdrant_path = (
+    explicit_entity_path = os.environ.get("COSMIC_MEMORY_ENTITY_QDRANT_PATH")
+    shared_path = (
         os.environ.get("COSMIC_MEMORY_QDRANT_PATH")
         or os.environ.get("QDRANT_PATH")
         or default_path
     )
+    if explicit_entity_path:
+        qdrant_path = explicit_entity_path
+    elif qdrant_url:
+        qdrant_path = shared_path
+    elif shared_path:
+        qdrant_path = str(Path(shared_path).with_name("qdrant_entity_data"))
+    else:
+        qdrant_path = None
     return QdrantEntitySimilarityIndex(
         embedding_service=embedding_service,
         collection_name=os.environ.get("COSMIC_MEMORY_ENTITY_COLLECTION", "memory_entities"),
