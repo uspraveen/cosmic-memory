@@ -96,6 +96,7 @@ The current codebase now includes the first graph layer needed to support this:
 - exact-name auto-merge for non-person entities such as projects and tasks,
 - entity-level vector candidate generation over canonical names, aliases, and attributes,
 - write-time LLM extraction into canonical `graph_document` payloads,
+- internal LLM adjudication for ambiguous entity creation and merging,
 - one-hop graph-assisted passive recall,
 - graph-first active traversal when a graph store is attached.
 
@@ -134,10 +135,11 @@ When graph extraction is enabled, canonical write flow becomes:
 1. write request enters the memory service,
 2. an LLM extracts entities, identity candidates, aliases, typed relations, and temporal fields,
 3. the extraction result is deduplicated and normalized locally,
-4. the normalized `graph_document` is written back into canonical Markdown metadata,
-5. the same normalized document is ingested into the graph projection,
-6. changed entities are synced into the entity-similarity index,
-7. the passive index is updated independently.
+4. ambiguous entity candidates can be passed to an internal adjudicator,
+5. the normalized `graph_document` is written back into canonical Markdown metadata,
+6. the same normalized document is ingested into the graph projection,
+7. changed entities are synced into the entity-similarity index,
+8. the passive index is updated independently.
 
 This keeps graph intelligence on the ingestion side and keeps passive recall
 free of query-time LLM latency.
@@ -148,7 +150,8 @@ Entity candidate resolution is intentionally layered:
 2. exact normalized-name auto-merge for allowed non-person entity types
 3. weak alias-only matches become provisional candidates
 4. entity vector similarity produces a shortlist over compatible ontology types
-5. only very high-confidence similarity hits auto-merge; the rest stay provisional
+5. an internal adjudicator can reason over shortlisted candidates for ambiguous cases
+6. only very high-confidence similarity hits auto-merge without adjudication; the rest stay provisional
 
 At the moment, the implemented graph backends are intentionally limited:
 
@@ -226,6 +229,10 @@ These are not meant to be arbitrary helper endpoints. They are the typed memory
 control surface the orchestrator should use instead of generating raw Cypher or
 re-implementing memory heuristics in every agent.
 
+The same principle applies to memory authoring: agents should use a small
+number of canonical write paths, while entity-candidate search and ambiguous
+merge decisions stay inside the memory subsystem as internal adjudication work.
+
 ## Why Library-First
 
 Passive recall is on Cosmic's hot path. If the Gateway and memory layer are
@@ -271,6 +278,7 @@ The current milestone in this repo now includes:
 - provide token-budget-aware passive recall with multi-factor reranking and budget packing,
 - provide batch and parallel request handling for embedding/index work.
 - provide a dedicated entity-similarity index for merge candidate generation and graph seeding,
+- provide an internal xAI-backed adjudicator for ambiguous entity resolution on write,
 - provide an agent/orchestrator control surface for memory planning and graph-aware lookup.
 
 The next backend milestones are:

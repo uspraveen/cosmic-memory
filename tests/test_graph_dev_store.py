@@ -6,6 +6,7 @@ from cosmic_memory.domain.models import (
     GenerateEmbeddingsResponse,
 )
 from cosmic_memory.graph import (
+    EntityAdjudicationDecision,
     EntityType,
     GraphDocument,
     GraphDocumentEntity,
@@ -55,6 +56,22 @@ class SemanticTestEmbeddingService:
             vector[3] = 1.0
         norm = sum(value * value for value in vector) ** 0.5
         return [value / norm for value in vector]
+
+
+class FakeEntityAdjudicator:
+    model_name = "fake-adjudicator"
+    timezone_name = "UTC"
+
+    def __init__(self, decision: EntityAdjudicationDecision) -> None:
+        self.decision = decision
+        self.requests = []
+
+    async def adjudicate(self, request) -> EntityAdjudicationDecision:
+        self.requests.append(request)
+        return self.decision
+
+    async def close(self) -> None:
+        return None
 
 
 def test_graph_store_merges_same_email_into_one_person():
@@ -298,5 +315,110 @@ def test_passive_search_can_seed_entities_from_entity_similarity():
         assert result.relations
         assert result.relations[0].relation_type == RelationType.BLOCKED_BY
         assert "mem_similarity_rel" in result.supporting_memory_ids
+
+    asyncio.run(run())
+
+
+def test_graph_store_can_use_internal_adjudicator_to_merge_similarity_candidates():
+    async def run():
+        adjudicator = FakeEntityAdjudicator(
+            EntityAdjudicationDecision(
+                decision="exact_match",
+                chosen_entity_id="placeholder",
+                confidence=0.94,
+                rationale="todo and task clearly describe the same roadmap work item",
+            )
+        )
+        store = InMemoryGraphStore(
+            entity_index=InMemoryEntitySimilarityIndex(
+                embedding_service=SemanticTestEmbeddingService()
+            ),
+            adjudicator=adjudicator,
+        )
+        first = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_adjudicate_1",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                        alias_values=["Roadmap action item"],
+                    )
+                ],
+                source_text="Roadmap task is the tracked work item for the plan.",
+            )
+        )
+        existing_entity_id = first.entity_ids[0]
+        adjudicator.decision.chosen_entity_id = existing_entity_id
+
+        second = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_adjudicate_2",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="todo",
+                        entity_type=EntityType.REMINDER,
+                        canonical_name="Roadmap todo",
+                    )
+                ],
+                source_text="Roadmap todo refers to the same work item already tracked in the roadmap task.",
+            )
+        )
+
+        assert second.entity_ids == [existing_entity_id]
+        assert second.resolution_events[0].status == "exact_match"
+        assert adjudicator.requests
+        assert adjudicator.requests[0].candidate_entities
+        assert adjudicator.requests[0].candidate_entities[0].entity_id == existing_entity_id
+
+    asyncio.run(run())
+
+
+def test_graph_store_can_use_internal_adjudicator_to_create_new_entity():
+    async def run():
+        adjudicator = FakeEntityAdjudicator(
+            EntityAdjudicationDecision(
+                decision="created_new",
+                confidence=0.82,
+                rationale="the candidate entity is related but not the same thing",
+            )
+        )
+        store = InMemoryGraphStore(
+            entity_index=InMemoryEntitySimilarityIndex(
+                embedding_service=SemanticTestEmbeddingService()
+            ),
+            adjudicator=adjudicator,
+        )
+        first = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_adjudicate_new_1",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                    )
+                ],
+                source_text="Roadmap task is one tracked item.",
+            )
+        )
+        second = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_adjudicate_new_2",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="todo",
+                        entity_type=EntityType.REMINDER,
+                        canonical_name="Roadmap todo",
+                    )
+                ],
+                source_text="Roadmap todo is a separate reminder related to the task but not the same entity.",
+            )
+        )
+
+        assert second.entity_ids[0] != first.entity_ids[0]
+        assert second.resolution_events[0].status == "created_new"
+        assert adjudicator.requests
 
     asyncio.run(run())

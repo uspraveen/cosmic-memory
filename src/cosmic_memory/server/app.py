@@ -28,7 +28,11 @@ from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.env import load_env_file
 from cosmic_memory.extraction import XAIGraphExtractionService
 from cosmic_memory.filesystem_service import FilesystemMemoryService
-from cosmic_memory.graph import InMemoryGraphStore, Neo4jGraphStore
+from cosmic_memory.graph import (
+    InMemoryGraphStore,
+    Neo4jGraphStore,
+    XAIEntityAdjudicationService,
+)
 from cosmic_memory.graph.entity_index import InMemoryEntitySimilarityIndex
 from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
@@ -302,12 +306,13 @@ def _build_graph_store_from_env(
     backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
     if backend in {"", "none", "off"}:
         return None
+    adjudicator = _build_graph_adjudicator_from_env()
     entity_index = _build_entity_index_from_env(
         embedding_service,
         default_path=default_path,
     )
     if backend == "memory":
-        return InMemoryGraphStore(entity_index=entity_index)
+        return InMemoryGraphStore(entity_index=entity_index, adjudicator=adjudicator)
     if backend == "neo4j":
         uri = os.environ.get("COSMIC_MEMORY_NEO4J_URI")
         username = os.environ.get("COSMIC_MEMORY_NEO4J_USERNAME")
@@ -325,6 +330,7 @@ def _build_graph_store_from_env(
             password=password,
             database=database,
             entity_index=entity_index,
+            adjudicator=adjudicator,
         )
     raise RuntimeError(
         f"Unsupported graph backend: {backend}. "
@@ -387,5 +393,40 @@ def _build_graph_extractor_from_env():
         ),
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS", "12.0")
+        ),
+    )
+
+
+def _build_graph_adjudicator_from_env():
+    raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED")
+    api_key = os.environ.get("XAI_API_KEY")
+    if raw_enabled is None:
+        enabled = bool(api_key)
+    else:
+        enabled = raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+    if not api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required when graph adjudication is enabled."
+        )
+    return XAIEntityAdjudicationService(
+        api_key=api_key,
+        model_name=os.environ.get(
+            "COSMIC_MEMORY_GRAPH_ADJUDICATE_MODEL",
+            "grok-4-1-fast-reasoning",
+        ),
+        timezone_name=os.environ.get("COSMIC_MEMORY_TIMEZONE", "UTC"),
+        max_parallel_requests=int(
+            os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_PARALLEL", "2")
+        ),
+        max_retries=int(
+            os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_RETRIES", "3")
+        ),
+        retry_base_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_BASE_SECONDS", "1.0")
+        ),
+        retry_max_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_MAX_SECONDS", "12.0")
         ),
     )

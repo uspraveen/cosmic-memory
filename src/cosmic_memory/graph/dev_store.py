@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections import defaultdict, deque
+from datetime import timezone
 
 from cosmic_memory.domain.models import utc_now
+from cosmic_memory.graph.adjudication import (
+    EntityAdjudicationRequest,
+    EntityAdjudicationService,
+    EntityCandidateContext,
+)
 from cosmic_memory.graph.entity_index import EntitySimilarityIndex, entity_similarity_text_parts
 from cosmic_memory.graph.identity import build_identity_key
 from cosmic_memory.graph.models import (
@@ -27,18 +34,27 @@ from cosmic_memory.graph.resolution import (
     entity_allows_name_auto_merge,
     similarity_candidate_types,
 )
+from cosmic_memory.graph.xai_adjudicator import build_local_time_anchor
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryGraphStore:
     """Small in-memory graph store with strict identity merge rules."""
 
-    def __init__(self, *, entity_index: EntitySimilarityIndex | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        entity_index: EntitySimilarityIndex | None = None,
+        adjudicator: EntityAdjudicationService | None = None,
+    ) -> None:
         self._entities: dict[str, GraphEntityNode] = {}
         self._identity_keys: dict[str, GraphIdentityKey] = {}
         self._entity_to_relations: dict[str, set[str]] = defaultdict(set)
         self._relations: dict[str, GraphRelationEdge] = {}
         self._key_to_entities: dict[str, set[str]] = defaultdict(set)
         self.entity_index = entity_index
+        self.adjudicator = adjudicator
 
     async def ingest_document(self, document: GraphDocument) -> GraphIngestResult:
         ref_to_entity_id: dict[str, str] = {}
@@ -46,7 +62,7 @@ class InMemoryGraphStore:
         changed_entity_ids: set[str] = set()
 
         for entity in document.entities:
-            resolved_entity, events = await self._upsert_entity(document.memory_id, entity)
+            resolved_entity, events = await self._upsert_entity(document, entity)
             ref_to_entity_id[entity.local_ref] = resolved_entity.entity_id
             changed_entity_ids.add(resolved_entity.entity_id)
             resolution_events.extend(events)
@@ -211,7 +227,12 @@ class InMemoryGraphStore:
     async def get_entity(self, entity_id: str) -> GraphEntityNode | None:
         return self._entities.get(entity_id)
 
-    async def _upsert_entity(self, memory_id: str, entity) -> tuple[GraphEntityNode, list[IdentityResolutionResult]]:
+    async def _upsert_entity(
+        self,
+        document: GraphDocument,
+        entity,
+    ) -> tuple[GraphEntityNode, list[IdentityResolutionResult]]:
+        memory_id = document.memory_id
         identity_candidates = list(entity.identity_candidates)
         for raw_value in [entity.canonical_name, *entity.alias_values]:
             identity_candidates.append(
@@ -274,58 +295,30 @@ class InMemoryGraphStore:
                     entity_id=entity_id,
                 )
             )
-        elif weak_matches:
-            resolved_entity = self._create_entity(memory_id, entity, provisional=True)
-            resolution_events.append(
-                IdentityResolutionResult(
-                    status="candidate_match",
-                    entity_id=resolved_entity.entity_id,
-                    candidates=[
-                        IdentityResolutionCandidate(
-                            entity_id=entity_id,
-                            reason="weak_alias_only_match",
-                            confidence=0.35,
-                        )
-                        for entity_id in sorted(weak_matches)
-                    ],
-                )
+        else:
+            similarity_hits = await self._similarity_hits(entity)
+            decision = await self._resolve_ambiguous_entity(
+                document=document,
+                document_entity=entity,
+                strong_match_ids=sorted(strong_matches),
+                weak_match_ids=sorted(weak_matches),
+                similarity_hits=similarity_hits,
             )
-        elif self.entity_index is not None:
-            similarity_hits = await self.entity_index.search(
-                entity_similarity_text_parts(
-                    entity_type=entity.entity_type,
-                    canonical_name=entity.canonical_name,
-                    alias_values=entity.alias_values,
-                    attributes=entity.attributes,
-                ),
-                entity_types=sorted(similarity_candidate_types(entity.entity_type), key=lambda value: value.value),
-                limit=5,
-            )
-            auto_merge_hits = [hit for hit in similarity_hits if hit.score >= 0.92]
-            candidate_hits = [hit for hit in similarity_hits if 0.78 <= hit.score < 0.92]
-            if auto_merge_hits:
-                resolved_entity = self._entities[auto_merge_hits[0].entity_id]
+            if decision is None:
+                resolved_entity = self._create_entity(memory_id, entity, provisional=False)
                 resolution_events.append(
                     IdentityResolutionResult(
-                        status="exact_match",
+                        status="created_new",
                         entity_id=resolved_entity.entity_id,
                     )
                 )
-            elif candidate_hits:
+            elif decision.status == "exact_match" and decision.entity_id in self._entities:
+                resolved_entity = self._entities[decision.entity_id]
+                resolution_events.append(decision)
+            elif decision.status == "candidate_match":
                 resolved_entity = self._create_entity(memory_id, entity, provisional=True)
                 resolution_events.append(
-                    IdentityResolutionResult(
-                        status="candidate_match",
-                        entity_id=resolved_entity.entity_id,
-                        candidates=[
-                            IdentityResolutionCandidate(
-                                entity_id=hit.entity_id,
-                                reason="entity_similarity_candidate",
-                                confidence=min(max(hit.score, 0.0), 1.0),
-                            )
-                            for hit in candidate_hits
-                        ],
-                    )
+                    decision.model_copy(update={"entity_id": resolved_entity.entity_id})
                 )
             else:
                 resolved_entity = self._create_entity(memory_id, entity, provisional=False)
@@ -335,14 +328,6 @@ class InMemoryGraphStore:
                         entity_id=resolved_entity.entity_id,
                     )
                 )
-        else:
-            resolved_entity = self._create_entity(memory_id, entity, provisional=False)
-            resolution_events.append(
-                IdentityResolutionResult(
-                    status="created_new",
-                    entity_id=resolved_entity.entity_id,
-                )
-            )
 
         self._merge_entity(memory_id, resolved_entity, entity, keys)
         return resolved_entity, resolution_events
@@ -585,6 +570,238 @@ class InMemoryGraphStore:
     async def close(self) -> None:
         if self.entity_index is not None:
             await self.entity_index.close()
+        if self.adjudicator is not None:
+            await self.adjudicator.close()
+
+    async def _similarity_hits(self, entity) -> list:
+        if self.entity_index is None:
+            return []
+        return await self.entity_index.search(
+            entity_similarity_text_parts(
+                entity_type=entity.entity_type,
+                canonical_name=entity.canonical_name,
+                alias_values=entity.alias_values,
+                attributes=entity.attributes,
+            ),
+            entity_types=sorted(
+                similarity_candidate_types(entity.entity_type),
+                key=lambda value: value.value,
+            ),
+            limit=5,
+        )
+
+    async def _resolve_ambiguous_entity(
+        self,
+        *,
+        document: GraphDocument,
+        document_entity,
+        strong_match_ids: list[str],
+        weak_match_ids: list[str],
+        similarity_hits: list,
+    ) -> IdentityResolutionResult | None:
+        candidate_contexts = self._build_candidate_contexts(
+            strong_match_ids=strong_match_ids,
+            weak_match_ids=weak_match_ids,
+            similarity_hits=similarity_hits,
+        )
+        if self.adjudicator is not None and candidate_contexts:
+            timezone_name = getattr(self.adjudicator, "timezone_name", "UTC")
+            try:
+                decision = await self.adjudicator.adjudicate(
+                    EntityAdjudicationRequest(
+                        memory_id=document.memory_id,
+                        pending_entity=document_entity,
+                        candidate_entities=candidate_contexts,
+                        source_text=document.source_text,
+                        utc_time_anchor=utc_now(),
+                        local_time_anchor=build_local_time_anchor(timezone_name),
+                        provenance_created_at=document.created_at.astimezone(timezone.utc),
+                        timezone_name=timezone_name,
+                    )
+                )
+            except Exception:
+                logger.exception("Entity adjudication failed for memory %s", document.memory_id)
+            else:
+                coerced = self._decision_to_resolution_result(decision, candidate_contexts)
+                if coerced is not None:
+                    return coerced
+
+        if strong_match_ids:
+            return IdentityResolutionResult(
+                status="candidate_match",
+                candidates=[
+                    IdentityResolutionCandidate(
+                        entity_id=entity_id,
+                        reason="multiple_strong_identity_matches",
+                        confidence=0.5,
+                    )
+                    for entity_id in strong_match_ids
+                ],
+            )
+        if weak_match_ids:
+            return IdentityResolutionResult(
+                status="candidate_match",
+                candidates=[
+                    IdentityResolutionCandidate(
+                        entity_id=entity_id,
+                        reason="weak_alias_only_match",
+                        confidence=0.35,
+                    )
+                    for entity_id in weak_match_ids
+                ],
+            )
+        auto_merge_hits = [hit for hit in similarity_hits if hit.score >= 0.92]
+        candidate_hits = [hit for hit in similarity_hits if 0.78 <= hit.score < 0.92]
+        if auto_merge_hits:
+            return IdentityResolutionResult(
+                status="exact_match",
+                entity_id=auto_merge_hits[0].entity_id,
+            )
+        if candidate_hits:
+            return IdentityResolutionResult(
+                status="candidate_match",
+                candidates=[
+                    IdentityResolutionCandidate(
+                        entity_id=hit.entity_id,
+                        reason="entity_similarity_candidate",
+                        confidence=min(max(hit.score, 0.0), 1.0),
+                    )
+                    for hit in candidate_hits
+                ],
+            )
+        return None
+
+    def _build_candidate_contexts(
+        self,
+        *,
+        strong_match_ids: list[str],
+        weak_match_ids: list[str],
+        similarity_hits: list,
+    ) -> list[EntityCandidateContext]:
+        candidates: dict[str, EntityCandidateContext] = {}
+
+        for entity_id in strong_match_ids:
+            context = self._candidate_context_for_entity_id(
+                entity_id,
+                match_reason="multiple_strong_identity_matches",
+            )
+            if context is not None:
+                candidates[entity_id] = context
+
+        for entity_id in weak_match_ids:
+            context = self._candidate_context_for_entity_id(
+                entity_id,
+                match_reason="weak_alias_only_match",
+            )
+            if context is not None:
+                existing = candidates.get(entity_id)
+                if existing is None:
+                    candidates[entity_id] = context
+                else:
+                    existing.match_reasons = list(
+                        dict.fromkeys([*existing.match_reasons, *context.match_reasons])
+                    )
+
+        for hit in similarity_hits:
+            context = self._candidate_context_for_entity_id(
+                hit.entity_id,
+                match_reason="entity_similarity_candidate",
+                similarity_score=min(max(hit.score, 0.0), 1.0),
+            )
+            if context is None:
+                continue
+            existing = candidates.get(hit.entity_id)
+            if existing is None:
+                candidates[hit.entity_id] = context
+            else:
+                existing.match_reasons = list(
+                    dict.fromkeys([*existing.match_reasons, *context.match_reasons])
+                )
+                existing.similarity_score = max(
+                    existing.similarity_score or 0.0,
+                    context.similarity_score or 0.0,
+                )
+
+        ranked = sorted(
+            candidates.values(),
+            key=lambda item: (
+                max(item.similarity_score or 0.0, 0.0),
+                len(item.match_reasons),
+                item.memory_count,
+            ),
+            reverse=True,
+        )
+        return ranked[:5]
+
+    def _candidate_context_for_entity_id(
+        self,
+        entity_id: str,
+        *,
+        match_reason: str,
+        similarity_score: float | None = None,
+    ) -> EntityCandidateContext | None:
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            return None
+        relation_summaries = []
+        for relation_id in list(self._entity_to_relations.get(entity_id, set()))[:4]:
+            relation = self._relations.get(relation_id)
+            if relation is None:
+                continue
+            counterpart_id = (
+                relation.target_entity_id
+                if relation.source_entity_id == entity_id
+                else relation.source_entity_id
+            )
+            counterpart = self._entities.get(counterpart_id)
+            counterpart_name = counterpart.canonical_name if counterpart is not None else counterpart_id
+            relation_summaries.append(f"{relation.relation_type.value} -> {counterpart_name}")
+        return EntityCandidateContext(
+            entity_id=entity.entity_id,
+            entity_type=entity.entity_type,
+            canonical_name=entity.canonical_name,
+            alias_values=entity.alias_values,
+            attributes=entity.attributes,
+            resolution_state=entity.resolution_state,
+            memory_count=len(entity.memory_ids),
+            relation_summaries=relation_summaries,
+            similarity_score=similarity_score,
+            match_reasons=[match_reason],
+        )
+
+    @staticmethod
+    def _decision_to_resolution_result(
+        decision,
+        candidate_contexts: list[EntityCandidateContext],
+    ) -> IdentityResolutionResult | None:
+        candidate_map = {candidate.entity_id: candidate for candidate in candidate_contexts}
+        if decision.decision == "exact_match":
+            if decision.chosen_entity_id not in candidate_map:
+                return None
+            return IdentityResolutionResult(
+                status="exact_match",
+                entity_id=decision.chosen_entity_id,
+            )
+        if decision.decision == "candidate_match":
+            candidate_ids = [
+                entity_id
+                for entity_id in decision.candidate_entity_ids
+                if entity_id in candidate_map
+            ] or [candidate.entity_id for candidate in candidate_contexts]
+            return IdentityResolutionResult(
+                status="candidate_match",
+                candidates=[
+                    IdentityResolutionCandidate(
+                        entity_id=entity_id,
+                        reason="llm_entity_adjudication_candidate",
+                        confidence=min(max(decision.confidence, 0.0), 1.0),
+                    )
+                    for entity_id in candidate_ids
+                ],
+            )
+        if decision.decision == "created_new":
+            return IdentityResolutionResult(status="created_new")
+        return None
 
 
 def _tokenize(text: str) -> set[str]:

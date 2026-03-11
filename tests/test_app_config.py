@@ -4,6 +4,7 @@ from cosmic_memory.embeddings.hash import HashEmbeddingService
 from cosmic_memory.server.app import (
     _build_embedding_service_from_env,
     _build_entity_index_from_env,
+    _build_graph_adjudicator_from_env,
     _build_graph_extractor_from_env,
     _build_graph_store_from_env,
     _build_passive_index_from_env,
@@ -49,15 +50,18 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
             password: str,
             database: str,
             entity_index,
+            adjudicator,
         ) -> None:
             captured["uri"] = uri
             captured["username"] = username
             captured["password"] = password
             captured["database"] = database
             captured["entity_index"] = entity_index
+            captured["adjudicator"] = adjudicator
 
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
     monkeypatch.setenv("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "false")
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED", "false")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_URI", "bolt://localhost:7687")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_USERNAME", "neo4j")
     monkeypatch.setenv("COSMIC_MEMORY_NEO4J_PASSWORD", "secret")
@@ -72,6 +76,7 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
         "password": "secret",
         "database": "neo4j",
         "entity_index": None,
+        "adjudicator": None,
     }
 
 
@@ -115,6 +120,34 @@ def test_build_graph_extractor_can_construct_xai_backend(monkeypatch: pytest.Mon
     monkeypatch.setattr("cosmic_memory.server.app.XAIGraphExtractionService", FakeExtractor)
 
     _build_graph_extractor_from_env()
+
+    assert captured["api_key"] == "secret"
+    assert captured["model_name"] == "grok-4-1-fast-reasoning"
+    assert captured["timezone_name"] == "America/Chicago"
+
+
+def test_build_graph_adjudicator_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED", "true")
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError):
+        _build_graph_adjudicator_from_env()
+
+
+def test_build_graph_adjudicator_can_construct_xai_backend(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeAdjudicator:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED", "true")
+    monkeypatch.setenv("XAI_API_KEY", "secret")
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_ADJUDICATE_MODEL", "grok-4-1-fast-reasoning")
+    monkeypatch.setenv("COSMIC_MEMORY_TIMEZONE", "America/Chicago")
+    monkeypatch.setattr("cosmic_memory.server.app.XAIEntityAdjudicationService", FakeAdjudicator)
+
+    _build_graph_adjudicator_from_env()
 
     assert captured["api_key"] == "secret"
     assert captured["model_name"] == "grok-4-1-fast-reasoning"

@@ -1,6 +1,12 @@
 """Graph primitives for identity resolution and traversal."""
 
 from cosmic_memory.graph.base import GraphStore
+from cosmic_memory.graph.adjudication import (
+    EntityAdjudicationDecision,
+    EntityAdjudicationRequest,
+    EntityAdjudicationService,
+    EntityCandidateContext,
+)
 from cosmic_memory.graph.dev_store import InMemoryGraphStore
 from cosmic_memory.graph.entity_index import (
     EntitySimilarityHit,
@@ -37,11 +43,16 @@ from cosmic_memory.graph.neo4j_store import Neo4jGraphStore
 from cosmic_memory.graph.ontology import EntityType, IdentityKeyType, QueryIntent, RelationType
 from cosmic_memory.graph.query import build_query_frame
 from cosmic_memory.graph.resolution import STRONG_KEY_TYPES, entity_allows_name_auto_merge
+from cosmic_memory.graph.xai_adjudicator import XAIEntityAdjudicationService
 
 __all__ = [
     "EntityType",
     "EntitySimilarityHit",
     "EntitySimilarityIndex",
+    "EntityAdjudicationDecision",
+    "EntityAdjudicationRequest",
+    "EntityAdjudicationService",
+    "EntityCandidateContext",
     "GraphDocument",
     "GraphDocumentEntity",
     "GraphDocumentRelation",
@@ -72,4 +83,5 @@ __all__ = [
     "normalize_name_variant",
     "should_extract_graph_for_kind",
     "STRONG_KEY_TYPES",
+    "XAIEntityAdjudicationService",
 ]

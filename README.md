@@ -44,6 +44,7 @@ flowchart LR
         AR[Active Agentic Memory]
         CS[Agent Control Surface]
         EXT[LLM Graph Extraction]
+        ADJ[Internal Memory Adjudicator]
         REG[SQLite Registry]
         MD[Canonical Markdown]
         Q[(Qdrant<br/>memory index)]
@@ -56,6 +57,7 @@ flowchart LR
     CM --> AR
     CM --> CS
     EXT --> MD
+    ADJ --> N
     MD <--> REG
     MD --> Q
     MD --> N
@@ -78,6 +80,7 @@ sequenceDiagram
     participant GW as Gateway / Agent
     participant CM as cosmic-memory
     participant X as xAI Extractor
+    participant A as Memory Adjudicator
     participant MD as Markdown Store
     participant REG as SQLite Registry
     participant G as Graph Store
@@ -91,6 +94,8 @@ sequenceDiagram
         CM->>X: extract entities / relations / time anchors
         X-->>CM: graph_document
         CM->>MD: write normalized graph metadata
+        CM->>A: adjudicate ambiguous entity merges
+        A-->>CM: merge / candidate / create_new
         CM->>G: ingest graph_document
         G->>EI: sync changed entities
     end
@@ -140,6 +145,7 @@ The current milestone in this repo provides:
 - token-budget-aware passive recall with multi-factor reranking,
 - graph ontology and deterministic identity normalization foundations,
 - write-time xAI graph extraction with structured output support,
+- internal xAI-backed entity adjudication for ambiguous graph writes,
 - document-level graph dedup normalization before graph ingest,
 - a dedicated entity-similarity index for entity candidate generation and graph seeding,
 - graph-assisted passive recall and graph-first active recall when a graph store is attached,
@@ -226,6 +232,12 @@ Relevant environment variables:
 - `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES` (default `3`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_BASE_SECONDS` (default `1.0`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED` (default `true` when `XAI_API_KEY` is present)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_MODEL` (default `grok-4-1-fast-reasoning`)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_PARALLEL` (default `2`)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_RETRIES` (default `3`)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_BASE_SECONDS` (default `1.0`)
+- `COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_MAX_SECONDS` (default `12.0`)
 - `COSMIC_MEMORY_TIMEZONE` (default `UTC`)
 - `COSMIC_MEMORY_ENV_FILE` (default `.env`)
 
@@ -249,6 +261,7 @@ Graph notes:
 - non-person entities such as `project`, `task`, and `organization` can auto-merge by exact normalized name,
 - entity similarity uses a separate Qdrant collection and the same Perplexity embedding model as passive memory,
 - vector similarity is only used for shortlist generation after exact identity and normalized-name checks,
+- ambiguous entity creation and merge decisions can be escalated to an internal xAI adjudicator,
 - ambiguous similarity hits become provisional `candidate_match` results instead of silent auto-merges,
 - write-time extraction stores normalized `graph_document` payloads back into canonical Markdown,
 - extraction prompts are explicitly time-aware and resolve relative dates against UTC and local timezone anchors,
@@ -300,6 +313,11 @@ Index behavior is aligned with the current Cosmic architecture:
 The agent-facing API is intentionally small. It is not meant to expose raw graph
 or index internals; it is meant to give the orchestrator stable memory
 primitives:
+
+Memory authoring intentionally follows the same rule: agents are expected to
+call high-level canonical write paths, while entity-candidate retrieval and
+ambiguous merge decisions stay inside `cosmic-memory` as an internal
+adjudication step.
 
 - `schema_context`
   - inject ontology, memory kinds, relation types, and tool guidance before complex planning
