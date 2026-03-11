@@ -10,6 +10,22 @@ supporting two integration modes:
 - in-process library calls for low-latency hot paths,
 - internal HTTP endpoints for orchestrator and agent access.
 
+The current thin Cosmic Gateway integration uses the internal HTTP mode. Gateway
+owns live session state in `sessions.db`, then calls `cosmic-memory` over
+loopback HTTP for:
+
+- `core_fact` block loading,
+- passive recall during prompt assembly,
+- transcript/episode ingestion for completed conversation turns,
+- internal memory proxy routes for future `MemoryRead` / `MemoryWrite` tools.
+
+That integration is intentionally thin for now:
+
+- long-term memory is injected into direct-route and orchestrator prompts,
+- the model-router also receives the assembled long-term memory block during classification,
+- daily rollover summaries are now written back into long-term memory through the Gateway rollover path,
+- task summaries and agent-note sync are still the next Gateway-side steps.
+
 The app-factory split is now explicit:
 
 - `create_default_app()` is production-oriented and env-backed,

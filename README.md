@@ -7,7 +7,7 @@ being built as a library-first Python package with an optional API server so
 Cosmic can:
 
 - keep memory logic isolated from the Gateway and agents,
-- preserve fast in-process access for hot-path passive recall,
+- preserve a clean library-first core while supporting loopback HTTP integration,
 - expose stable internal endpoints for orchestrator and agent use,
 - evolve the memory layer independently over time.
 
@@ -36,7 +36,7 @@ memory-layer operations.
 flowchart LR
     U[User Query] --> G[Cosmic Gateway]
     G --> S[sessions.db<br/>live daily session]
-    G --> CM[cosmic-memory]
+    G -->|internal HTTP today| CM[cosmic-memory]
 
     subgraph CMStack[cosmic-memory]
         CF[core_fact block]
@@ -238,6 +238,48 @@ graph extraction with `grok-4-1-fast-reasoning` by default.
 Production app factories also load a local `.env` file if present. A placeholder
 is included in [.env.example](C:/Users/Praveen Raj U S/Downloads/cosmic-memory/.env.example).
 
+## Current Gateway Integration
+
+The current thin Cosmic Gateway is now integrated with `cosmic-memory` over an
+internal HTTP boundary.
+
+What is live today in the Gateway integration:
+
+- every inbound query still uses `sessions.db` as the short-term conversation source,
+- the Gateway fetches the deterministic `core_fact` block from `GET /v1/core-facts`,
+- the Gateway runs passive recall through `POST /v1/query/passive`,
+- the resulting memory block is injected into direct-route and orchestrator prompts,
+- the model-router also receives the assembled long-term memory block during classification,
+- completed user/assistant turns are ingested back into `POST /v1/episodes` as transcript episodes,
+- daily session rollover summaries are written into long-term memory through the Gateway rollover path,
+- the Gateway exposes internal proxy routes for future `MemoryRead` / `MemoryWrite` style tooling:
+  - `POST /internal/memory/search`
+  - `POST /internal/memory/active-search`
+  - `POST /internal/memory/write`
+  - `POST /internal/memory/core-facts`
+  - `GET /internal/memory/core-facts`
+  - `POST /internal/memory/episodes`
+
+Important current limitation:
+
+- the thin Gateway integration injects long-term memory into direct/orchestrator
+  prompt assembly,
+- active agentic memory is still opt-in via the control surface rather than part
+  of the normal Gateway query path,
+- task-summary writes and agent-note sync are still the next Gateway-side
+  integrations to finish.
+
+Gateway environment variables for the current integration:
+
+- `COSMIC_MEMORY_URL` (for example `http://127.0.0.1:8090`)
+- `COSMIC_MEMORY_TIMEOUT_SEC` (default `12`)
+- `COSMIC_MEMORY_CORE_FACT_MAX_CHARS` (default `1500`)
+- `COSMIC_MEMORY_PASSIVE_MAX_RESULTS` (default `8`)
+- `COSMIC_MEMORY_PASSIVE_TOKEN_BUDGET` (default `12000`)
+- `COSMIC_MEMORY_PASSIVE_KINDS` (default `session_summary,task_summary,agent_note,user_data`)
+- `COSMIC_MEMORY_INGEST_TRANSCRIPTS` (default `true`)
+- `COSMIC_MEMORY_EPISODE_EXTRACT_GRAPH` (default `false`)
+
 Relevant environment variables:
 
 - `PERPLEXITY_API_KEY`
@@ -261,7 +303,7 @@ Relevant environment variables:
 - `COSMIC_MEMORY_NEO4J_USERNAME`
 - `COSMIC_MEMORY_NEO4J_PASSWORD`
 - `COSMIC_MEMORY_NEO4J_DATABASE` (default `neo4j`)
-- `COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED` (default `true` when `XAI_API_KEY` is present)
+- `COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED` (default `false`; enable explicitly when `XAI_API_KEY` is present and graph extraction is desired)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_MODEL` (default `grok-4-1-fast-reasoning`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_PARALLEL` (default `2`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES` (default `3`)
@@ -398,8 +440,8 @@ agent to relearn the ontology, traversal strategy, and ranking heuristics.
 
 ## Near-Term Plan
 
-1. Integrate passive recall with Cosmic Gateway session assembly.
-2. Wire `ingest_episode(...)` into Gateway session/task observation flow.
-3. Wire the new control surface into Gateway and orchestrator memory tooling.
-4. Add consolidation and conflict-resolution jobs.
-5. Add extraction queues, caches, and production observability.
+1. Finish Gateway compaction and daily-rollover summary writes through `cosmic-memory`.
+2. Wire shared memory tooling and the control surface into orchestrator/agent runtimes.
+3. Add consolidation and conflict-resolution jobs.
+4. Add extraction queues, caches, and production observability.
+5. Add richer evaluation over real Cosmic memory traffic.

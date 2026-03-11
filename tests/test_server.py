@@ -13,10 +13,33 @@ def test_health_endpoint():
     assert payload["service"] == "cosmic-memory"
 
 
+def test_internal_token_protects_service_endpoints(monkeypatch):
+    monkeypatch.setenv("GATEWAY_INTERNAL_TOKEN", "internal-secret")
+    client = TestClient(create_development_app())
+
+    unauthorized = client.get("/v1/core-facts")
+    assert unauthorized.status_code == 401
+
+    authorized = client.get(
+        "/v1/core-facts",
+        headers={"X-Internal-Token": "internal-secret"},
+    )
+    assert authorized.status_code == 200
+
+
+def test_health_endpoint_stays_public_with_internal_token(monkeypatch):
+    monkeypatch.setenv("GATEWAY_INTERNAL_TOKEN", "internal-secret")
+    client = TestClient(create_development_app())
+
+    response = client.get("/health")
+    assert response.status_code == 200
+
+
 def test_embedding_endpoint():
     client = TestClient(create_development_app())
     response = client.post(
         "/v1/embeddings/generate",
+        headers={"X-Internal-Token": ""},
         json={
             "texts": ["Cosmic memory", "Passive recall"],
             "dimensions": 128,
@@ -37,6 +60,7 @@ def test_core_fact_endpoint():
     client = TestClient(create_development_app())
     write_response = client.post(
         "/v1/core-facts",
+        headers={"X-Internal-Token": ""},
         json={
             "title": "Preference",
             "fact": "User prefers concise answers.",
@@ -53,7 +77,7 @@ def test_core_fact_endpoint():
     )
     assert write_response.status_code == 201
 
-    block_response = client.get("/v1/core-facts")
+    block_response = client.get("/v1/core-facts", headers={"X-Internal-Token": ""})
     assert block_response.status_code == 200
     payload = block_response.json()
     assert len(payload["items"]) == 1
@@ -64,6 +88,7 @@ def test_episode_ingest_endpoint():
     client = TestClient(create_development_app())
     response = client.post(
         "/v1/episodes",
+        headers={"X-Internal-Token": ""},
         json={
             "observations": [
                 {"role": "user", "content": "We should improve graph retrieval."},
@@ -89,13 +114,14 @@ def test_episode_ingest_endpoint():
 def test_agent_surface_endpoints():
     client = TestClient(create_development_app())
 
-    schema_response = client.get("/v1/agent/schema-context")
+    schema_response = client.get("/v1/agent/schema-context", headers={"X-Internal-Token": ""})
     assert schema_response.status_code == 200
     schema_payload = schema_response.json()
     assert any(tool["name"] == "passive_search" for tool in schema_payload["tools"])
 
     plan_response = client.post(
         "/v1/agent/plan",
+        headers={"X-Internal-Token": ""},
         json={"query": "What is currently blocking Cosmic Memory?"},
     )
     assert plan_response.status_code == 200
@@ -105,6 +131,7 @@ def test_agent_surface_endpoints():
 
     brief_response = client.post(
         "/v1/agent/memory-brief",
+        headers={"X-Internal-Token": ""},
         json={"query": "What is currently blocking Cosmic Memory?"},
     )
     assert brief_response.status_code == 200

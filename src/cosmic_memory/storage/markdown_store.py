@@ -28,7 +28,7 @@ class MarkdownRecordStore:
             (self.memory_root / directory).mkdir(parents=True, exist_ok=True)
 
     def write(self, record: MemoryRecord) -> MarkdownWriteResult:
-        path = path_for_record(self.memory_root, record.memory_id, record.kind)
+        path = path_for_record(self.memory_root, record)
         rendered = render_record_markdown(record)
         content_hash = hash_markdown_content(rendered)
 
@@ -77,7 +77,7 @@ class MarkdownRecordStore:
     def scan(self) -> list[CanonicalMemorySnapshot]:
         snapshots: list[CanonicalMemorySnapshot] = []
         for directory in KIND_DIRECTORY_MAP.values():
-            for path in sorted((self.memory_root / directory).glob("*.md")):
+            for path in sorted((self.memory_root / directory).rglob("*.md")):
                 text = path.read_text(encoding="utf-8")
                 record = self.parse(text)
                 snapshots.append(

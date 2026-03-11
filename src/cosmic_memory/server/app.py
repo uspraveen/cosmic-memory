@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from cosmic_memory.control_surface import (
     CurrentStateRequest,
@@ -46,6 +46,24 @@ def create_app(
     *,
     embedding_service: EmbeddingService,
 ) -> FastAPI:
+    internal_token = (
+        os.environ.get("COSMIC_MEMORY_INTERNAL_TOKEN")
+        or os.environ.get("GATEWAY_INTERNAL_TOKEN")
+        or ""
+    ).strip()
+
+    async def require_internal_token(
+        x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    ) -> None:
+        if not internal_token:
+            return
+        if x_internal_token == internal_token:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid internal token.",
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if _sync_on_startup_enabled():
@@ -71,22 +89,38 @@ def create_app(
         return await svc.health()
 
     @app.post("/v1/embeddings/generate")
-    async def generate_embeddings(payload: GenerateEmbeddingsRequest, request: Request):
+    async def generate_embeddings(
+        payload: GenerateEmbeddingsRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         embedder: EmbeddingService = request.app.state.embedding_service
         return await embedder.generate(payload)
 
     @app.post("/v1/memories", status_code=status.HTTP_201_CREATED)
-    async def write_memory(payload: WriteMemoryRequest, request: Request):
+    async def write_memory(
+        payload: WriteMemoryRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.write(payload)
 
     @app.post("/v1/episodes", status_code=status.HTTP_201_CREATED)
-    async def ingest_episode(payload: IngestEpisodeRequest, request: Request):
+    async def ingest_episode(
+        payload: IngestEpisodeRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.ingest_episode(payload)
 
     @app.post("/v1/core-facts", status_code=status.HTTP_201_CREATED)
-    async def write_core_fact(payload: WriteCoreFactRequest, request: Request):
+    async def write_core_fact(
+        payload: WriteCoreFactRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.write_core_fact(payload)
 
@@ -95,12 +129,17 @@ def create_app(
         request: Request,
         limit: int | None = None,
         max_chars: int = 1500,
+        _: None = Depends(require_internal_token),
     ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.build_core_fact_block(limit=limit, max_chars=max_chars)
 
     @app.get("/v1/memories/{memory_id}")
-    async def get_memory(memory_id: str, request: Request):
+    async def get_memory(
+        memory_id: str,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         record = await svc.get(memory_id)
         if record is None:
@@ -108,62 +147,107 @@ def create_app(
         return record
 
     @app.post("/v1/query/passive")
-    async def passive_recall(payload: PassiveRecallRequest, request: Request):
+    async def passive_recall(
+        payload: PassiveRecallRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.passive_recall(payload)
 
     @app.post("/v1/query/active")
-    async def active_recall(payload: ActiveRecallRequest, request: Request):
+    async def active_recall(
+        payload: ActiveRecallRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.active_recall(payload)
 
     @app.get("/v1/agent/schema-context")
-    async def get_schema_context(request: Request):
+    async def get_schema_context(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.get_schema_context()
 
     @app.post("/v1/agent/plan")
-    async def plan_query(payload: MemoryQueryPlanRequest, request: Request):
+    async def plan_query(
+        payload: MemoryQueryPlanRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.plan_query(payload)
 
     @app.post("/v1/agent/resolve-identity")
-    async def resolve_identity(payload: ResolveIdentityRequest, request: Request):
+    async def resolve_identity(
+        payload: ResolveIdentityRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.resolve_identity(payload)
 
     @app.post("/v1/agent/current-state")
-    async def current_state(payload: CurrentStateRequest, request: Request):
+    async def current_state(
+        payload: CurrentStateRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.get_current_state(payload)
 
     @app.post("/v1/agent/temporal-facts")
-    async def temporal_facts(payload: TemporalFactsRequest, request: Request):
+    async def temporal_facts(
+        payload: TemporalFactsRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.get_temporal_facts(payload)
 
     @app.post("/v1/agent/memory-brief")
-    async def memory_brief(payload: MemoryBriefRequest, request: Request):
+    async def memory_brief(
+        payload: MemoryBriefRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.build_memory_brief(payload)
 
     @app.get("/v1/index/status")
-    async def get_index_status(request: Request):
+    async def get_index_status(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.get_index_status()
 
     @app.post("/v1/index/sync")
-    async def sync_index(request: Request):
+    async def sync_index(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.sync_index()
 
     @app.post("/v1/index/rebuild")
-    async def rebuild_index(request: Request):
+    async def rebuild_index(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         return await svc.rebuild_index()
 
     @app.post("/v1/memories/{memory_id}/supersede")
-    async def supersede_memory(memory_id: str, payload: SupersedeMemoryRequest, request: Request):
+    async def supersede_memory(
+        memory_id: str,
+        payload: SupersedeMemoryRequest,
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
         svc: MemoryService = request.app.state.memory_service
         record = await svc.supersede(memory_id, payload)
         if record is None:
