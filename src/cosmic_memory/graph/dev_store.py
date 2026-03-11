@@ -447,10 +447,16 @@ class InMemoryGraphStore:
         if self.entity_index is not None:
             similarity_hits = await self.entity_index.search(query_frame.query, limit=6)
             for hit in similarity_hits:
+                if hit.entity_id not in self._entities:
+                    continue
                 score_map[hit.entity_id] = max(score_map.get(hit.entity_id, 0.0), hit.score * 0.85)
 
         ranked_entity_ids = sorted(score_map, key=lambda entity_id: score_map[entity_id], reverse=True)
-        return [entity_id for entity_id in ranked_entity_ids[:3] if score_map[entity_id] > 0]
+        return [
+            entity_id
+            for entity_id in ranked_entity_ids[:3]
+            if entity_id in self._entities and score_map[entity_id] > 0
+        ]
 
     def _resolve_exact_entity_ids(self, candidate: GraphIdentityCandidate) -> set[str]:
         try:

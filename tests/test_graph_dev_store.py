@@ -74,6 +74,35 @@ class FakeEntityAdjudicator:
         return None
 
 
+class StaleHitEntityIndex:
+    async def ensure_ready(self) -> None:
+        return None
+
+    async def sync_entity(self, entity) -> None:
+        return None
+
+    async def sync_entities(self, entities) -> None:
+        return None
+
+    async def delete_entities(self, entity_ids) -> None:
+        return None
+
+    async def search(self, query: str, *, entity_types=None, limit: int = 8):
+        from cosmic_memory.graph.entity_index import EntitySimilarityHit
+
+        return [
+            EntitySimilarityHit(
+                entity_id="ent_missing_from_graph",
+                score=0.99,
+                entity_type=EntityType.TASK,
+                canonical_name="Missing task",
+            )
+        ]
+
+    async def close(self) -> None:
+        return None
+
+
 def test_graph_store_merges_same_email_into_one_person():
     async def run():
         store = InMemoryGraphStore()
@@ -420,5 +449,33 @@ def test_graph_store_can_use_internal_adjudicator_to_create_new_entity():
         assert second.entity_ids[0] != first.entity_ids[0]
         assert second.resolution_events[0].status == "created_new"
         assert adjudicator.requests
+
+    asyncio.run(run())
+
+
+def test_passive_and_active_search_ignore_stale_entity_index_hits():
+    async def run():
+        store = InMemoryGraphStore(entity_index=StaleHitEntityIndex())
+        await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_stale_seed",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                    )
+                ],
+                source_text="Roadmap task is the tracked work item for the plan.",
+            )
+        )
+
+        passive = await store.passive_search(build_query_frame("What is the roadmap task?"))
+        active = await store.traverse(build_query_frame("What is the roadmap task?"))
+
+        assert passive.entities
+        assert active.entities
+        assert all(entity.entity_id != "ent_missing_from_graph" for entity in passive.entities)
+        assert all(entity.entity_id != "ent_missing_from_graph" for entity in active.entities)
 
     asyncio.run(run())
