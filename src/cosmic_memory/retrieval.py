@@ -13,6 +13,7 @@ from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     ActiveRecallDiagnostics,
     GraphEntity,
+    GraphEpisodeItem,
     GraphRelation,
     MemoryRecord,
     PassiveRecallDiagnostics,
@@ -22,6 +23,7 @@ from cosmic_memory.domain.models import (
 from cosmic_memory.graph.identity import normalize_email
 from cosmic_memory.graph.models import GraphQueryFrame, GraphSearchResult
 from cosmic_memory.graph.query import build_query_frame
+from cosmic_memory.graph.search_recipes import GraphRecipeApplication, apply_graph_search_recipe
 
 
 @dataclass(slots=True)
@@ -160,8 +162,10 @@ def build_active_response(
 
     entities: dict[str, GraphEntity] = {}
     relations: list[GraphRelation] = []
+    episodes: dict[str, GraphEpisodeItem] = {}
     for record, _ in matches:
         graph_entities, graph_relations = _graph_metadata_from_record(record)
+        graph_episode = _graph_episode_from_record(record)
         for entity in graph_entities:
             entity_id = entity.get("entity_id") or entity.get("name")
             if not entity_id:
@@ -189,18 +193,23 @@ def build_active_response(
                     relation_type=relation["relation_type"],
                     fact=relation["fact"],
                     memory_ids=[record.memory_id],
+                    episode_ids=list(relation.get("episode_ids") or []),
                     valid_at=relation.get("valid_at"),
                     invalid_at=relation.get("invalid_at"),
+                    invalidated_by_episode_id=relation.get("invalidated_by_episode_id"),
                 )
             )
+        if graph_episode is not None:
+            episodes[graph_episode.episode_id] = graph_episode
 
     return ActiveRecallResponse(
         items=items,
         entities=list(entities.values()),
         relations=relations,
+        episodes=list(episodes.values()),
         search_plan=[
             "lexical score over active canonical records",
-            "expand metadata-provided entities and relations",
+            "expand metadata-provided entities, relations, and episode provenance",
         ],
         diagnostics=diagnostics,
     )
@@ -237,12 +246,24 @@ def _graph_metadata_from_record(record: MemoryRecord) -> tuple[list[dict], list[
                     "target_entity_id": entity_id_map.get(target_ref, f"{record.memory_id}:{target_ref}"),
                     "relation_type": relation.get("relation_type", "mentions"),
                     "fact": relation.get("fact", ""),
+                    "episode_ids": [episode["episode_id"]] if (episode := graph_document.get("episode")) else [],
                     "valid_at": relation.get("valid_at"),
                     "invalid_at": relation.get("invalid_at"),
+                    "invalidated_by_episode_id": relation.get("invalidated_by_episode_id"),
                 }
             )
         return normalized_entities, normalized_relations
     return record.metadata.get("entities", []), record.metadata.get("relations", [])
+
+
+def _graph_episode_from_record(record: MemoryRecord) -> GraphEpisodeItem | None:
+    graph_document = record.metadata.get("graph_document")
+    if not isinstance(graph_document, dict):
+        return None
+    episode = graph_document.get("episode")
+    if not isinstance(episode, dict):
+        return None
+    return GraphEpisodeItem.model_validate(episode)
 
 
 def build_active_response_with_graph(
@@ -269,10 +290,32 @@ def build_active_response_with_graph(
             relation_type=relation.relation_type.value,
             fact=relation.fact,
             memory_ids=relation.memory_ids,
+            episode_ids=relation.episode_ids,
             valid_at=relation.valid_at,
             invalid_at=relation.invalid_at,
+            invalidated_by_episode_id=relation.invalidated_by_episode_id,
         )
         for relation in graph_result.relations
+    ]
+    response.episodes = [
+        GraphEpisodeItem(
+            episode_id=episode.episode_id,
+            memory_id=episode.memory_id,
+            source_type=episode.source_type,
+            provenance_source_kind=episode.provenance_source_kind,
+            provenance_source_id=episode.provenance_source_id,
+            session_id=episode.session_id,
+            task_id=episode.task_id,
+            channel=episode.channel,
+            created_at=episode.created_at,
+            extracted_at=episode.extracted_at,
+            extraction_confidence=episode.extraction_confidence,
+            rationale=episode.rationale,
+            source_excerpt=episode.source_excerpt,
+            produced_relation_ids=episode.produced_relation_ids,
+            invalidated_relation_ids=episode.invalidated_relation_ids,
+        )
+        for episode in graph_result.episodes
     ]
     response.search_plan = list(graph_result.search_plan)
     if graph_result.supporting_memory_ids:
@@ -289,10 +332,12 @@ def merge_passive_with_graph(
     max_results: int,
     token_budget: int,
     graph_bonus: float = 0.35,
+    graph_memory_boosts: dict[str, float] | None = None,
     include_breakdown: bool = False,
 ) -> PassiveRecallResponse:
     item_map: dict[str, RecallItem] = {item.memory_id: item for item in base_response.items}
     signals = build_query_signals(query)
+    graph_memory_boosts = graph_memory_boosts or {}
 
     for record in graph_records:
         if record.status is not RecordStatus.ACTIVE:
@@ -305,7 +350,7 @@ def merge_passive_with_graph(
             tokenize(" ".join([record.title or "", record.content, " ".join(record.tags)])),
         )
         score += score_tokens(signals.query_tokens, tokenize(record.title or "")) * 0.15
-        score += graph_bonus
+        score += graph_memory_boosts.get(record.memory_id, graph_bonus)
 
         existing = item_map.get(record.memory_id)
         if existing is not None:
@@ -321,7 +366,10 @@ def merge_passive_with_graph(
     ranked_items = rerank_passive_items(
         list(item_map.values()),
         query=query,
-        graph_memory_ids={record.memory_id for record in graph_records},
+        graph_memory_boosts={
+            record.memory_id: graph_memory_boosts.get(record.memory_id, graph_bonus)
+            for record in graph_records
+        },
         include_breakdown=include_breakdown,
     )
     rerank_ms = (perf_counter() - rerank_started) * 1000.0
@@ -442,11 +490,11 @@ def rerank_passive_items(
     items: list[RecallItem],
     *,
     query: str,
-    graph_memory_ids: set[str] | None = None,
+    graph_memory_boosts: dict[str, float] | None = None,
     include_breakdown: bool = False,
 ) -> list[RecallItem]:
     signals = build_query_signals(query)
-    graph_memory_ids = graph_memory_ids or set()
+    graph_memory_boosts = graph_memory_boosts or {}
 
     reranked: list[RecallItem] = []
     for item in items:
@@ -455,7 +503,7 @@ def rerank_passive_items(
         passive_bonus, breakdown = _passive_bonus(
             adjusted,
             signals=signals,
-            graph_memory_ids=graph_memory_ids,
+            graph_memory_boosts=graph_memory_boosts,
         )
         adjusted.score = adjusted.score + passive_bonus
         if include_breakdown:
@@ -554,13 +602,17 @@ def _passive_bonus(
     item: RecallItem,
     *,
     signals: QuerySignals,
-    graph_memory_ids: set[str],
+    graph_memory_boosts: dict[str, float],
 ) -> tuple[float, dict[str, float]]:
     bonus = 0.0
     breakdown: dict[str, float] = {}
     text_lower = " ".join([item.title or "", item.content, " ".join(item.tags)]).lower()
-    if item.memory_id in graph_memory_ids:
-        bonus += _record_breakdown(breakdown, "graph_support", 0.30)
+    if item.memory_id in graph_memory_boosts:
+        bonus += _record_breakdown(
+            breakdown,
+            "graph_support",
+            graph_memory_boosts[item.memory_id],
+        )
     if signals.query_lower and len(signals.query_lower) >= 12 and signals.query_lower in text_lower:
         bonus += _record_breakdown(breakdown, "phrase_match", 0.10)
     if signals.current_state_hint and {"active", "current", "ongoing"} & {tag.lower() for tag in item.tags}:
@@ -705,3 +757,18 @@ def _coerce_bool(value) -> bool | None:
         if normalized in {"false", "0", "no", "off"}:
             return False
     return bool(value)
+
+
+def apply_graph_recipe_for_mode(
+    *,
+    graph_result: GraphSearchResult,
+    query_frame: GraphQueryFrame,
+    mode: str,
+    max_results: int,
+) -> GraphRecipeApplication:
+    return apply_graph_search_recipe(
+        graph_result=graph_result,
+        query_frame=query_frame,
+        mode=mode,
+        max_results=max_results,
+    )

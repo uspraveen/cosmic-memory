@@ -85,3 +85,23 @@ INTENT_RELATION_MAP: dict[QueryIntent, set[RelationType]] = {
         RelationType.MENTIONS,
     },
 }
+
+
+_RELATION_COMPATIBILITY_MAP: dict[RelationType, set[RelationType]] = {
+    RelationType.HAS_IDENTITY_KEY: {RelationType.HAS_IDENTITY_KEY},
+    RelationType.WORKS_ON: {RelationType.WORKS_ON, RelationType.PART_OF},
+    RelationType.PART_OF: {RelationType.PART_OF, RelationType.WORKS_ON},
+    RelationType.MENTIONS: {RelationType.MENTIONS},
+    RelationType.PREFERS: {RelationType.PREFERS, RelationType.AVOIDS},
+    RelationType.AVOIDS: {RelationType.AVOIDS, RelationType.PREFERS},
+    RelationType.DECIDED: {RelationType.DECIDED, RelationType.SUPERSEDES},
+    RelationType.BLOCKED_BY: {RelationType.BLOCKED_BY},
+    RelationType.REMIND_AT: {RelationType.REMIND_AT, RelationType.VALID_DURING},
+    RelationType.KNOWS: {RelationType.KNOWS},
+    RelationType.SUPERSEDES: {RelationType.SUPERSEDES, RelationType.DECIDED},
+    RelationType.VALID_DURING: {RelationType.VALID_DURING, RelationType.REMIND_AT},
+}
+
+
+def compatible_relation_types(relation_type: RelationType) -> set[RelationType]:
+    return set(_RELATION_COMPATIBILITY_MAP.get(relation_type, {relation_type}))

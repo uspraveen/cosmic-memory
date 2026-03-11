@@ -16,11 +16,20 @@ from cosmic_memory.graph.adjudication import (
     EntityAdjudicationService,
     EntityCandidateContext,
 )
+from cosmic_memory.graph.fact_adjudication import (
+    FactAdjudicationRequest,
+    FactAdjudicationService,
+    FactCandidateContext,
+    PendingFactContext,
+    exact_fact_signature,
+)
 from cosmic_memory.graph.entity_index import EntitySimilarityIndex, entity_similarity_text_parts
 from cosmic_memory.graph.identity import build_identity_key
 from cosmic_memory.graph.models import (
     GraphDocument,
     GraphEntityNode,
+    GraphEpisode,
+    GraphFactQuery,
     GraphIdentityCandidate,
     GraphIdentityKey,
     GraphIngestResult,
@@ -29,7 +38,7 @@ from cosmic_memory.graph.models import (
     IdentityResolutionCandidate,
     IdentityResolutionResult,
 )
-from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
+from cosmic_memory.graph.ontology import IdentityKeyType, RelationType, compatible_relation_types
 from cosmic_memory.graph.resolution import (
     STRONG_KEY_TYPES,
     entity_allows_name_auto_merge,
@@ -58,6 +67,7 @@ class Neo4jGraphStore:
         database: str = "neo4j",
         entity_index: EntitySimilarityIndex | None = None,
         adjudicator: EntityAdjudicationService | None = None,
+        fact_adjudicator: FactAdjudicationService | None = None,
     ) -> None:
         try:
             from neo4j import AsyncGraphDatabase
@@ -71,6 +81,7 @@ class Neo4jGraphStore:
         self.database = database
         self.entity_index = entity_index
         self.adjudicator = adjudicator
+        self.fact_adjudicator = fact_adjudicator
         self._ready = False
         self._cache_lock = asyncio.Lock()
         self._search_cache: InMemoryGraphStore | None = None
@@ -81,6 +92,8 @@ class Neo4jGraphStore:
             ref_to_entity_id: dict[str, str] = {}
             resolution_events: list[IdentityResolutionResult] = []
             changed_entities: dict[str, GraphEntityNode] = {}
+            episode = _coerce_episode(document)
+            await self._persist_episode(session, episode)
 
             for entity in document.entities:
                 resolved_entity, events = await self._upsert_entity(
@@ -93,13 +106,16 @@ class Neo4jGraphStore:
                 resolution_events.extend(events)
 
             relation_ids: list[str] = []
+            invalidated_relation_ids: list[str] = []
             for relation in document.relations:
                 source_entity_id = ref_to_entity_id.get(relation.source_ref)
                 target_entity_id = ref_to_entity_id.get(relation.target_ref)
                 if source_entity_id is None or target_entity_id is None:
                     continue
-                edge = await self._upsert_relation(
+                edge, invalidated_ids = await self._upsert_relation(
                     session,
+                    document=document,
+                    episode=episode,
                     memory_id=document.memory_id,
                     source_entity_id=source_entity_id,
                     target_entity_id=target_entity_id,
@@ -110,12 +126,20 @@ class Neo4jGraphStore:
                     invalid_at=relation.invalid_at,
                     expires_at=relation.expires_at,
                 )
-                relation_ids.append(edge.relation_id)
+                if edge is not None:
+                    relation_ids.append(edge.relation_id)
+                invalidated_relation_ids.extend(invalidated_ids)
+
+            episode.produced_relation_ids = sorted(set(relation_ids))
+            episode.invalidated_relation_ids = sorted(set(invalidated_relation_ids))
+            await self._persist_episode(session, episode)
 
         result = GraphIngestResult(
             memory_id=document.memory_id,
-            entity_ids=sorted(set(ref_to_entity_id.values())),
-            relation_ids=sorted(set(relation_ids)),
+            episode_id=episode.episode_id,
+            entity_ids=list(dict.fromkeys(ref_to_entity_id.values())),
+            relation_ids=list(dict.fromkeys(relation_ids)),
+            invalidated_relation_ids=list(dict.fromkeys(invalidated_relation_ids)),
             resolution_events=resolution_events,
         )
         if self.entity_index is not None and changed_entities:
@@ -126,7 +150,18 @@ class Neo4jGraphStore:
     async def remove_memory(self, memory_id: str) -> None:
         await self._ensure_ready()
         touched_entity_ids: set[str] = set()
+        episode_ids_to_remove: list[str] = []
         async with self.driver.session(database=self.database) as session:
+            result = await session.run(
+                """
+                MATCH (ep:Episode {memory_id: $memory_id})
+                RETURN ep.episode_id AS episode_id
+                """,
+                memory_id=memory_id,
+            )
+            async for row in result:
+                episode_ids_to_remove.append(row["episode_id"])
+
             result = await session.run(
                 """
                 MATCH (rel:Relation)
@@ -142,10 +177,12 @@ class Neo4jGraphStore:
                         """
                         MATCH (rel:Relation {relation_id: $relation_id})
                         SET rel.memory_ids = $memory_ids,
+                            rel.episode_ids = [value IN coalesce(rel.episode_ids, []) WHERE NOT value IN $episode_ids],
                             rel.updated_at = $updated_at
                         """,
                         relation_id=row["relation_id"],
                         memory_ids=remaining,
+                        episode_ids=episode_ids_to_remove,
                         updated_at=_serialize_datetime(utc_now()),
                     )
                 else:
@@ -156,6 +193,18 @@ class Neo4jGraphStore:
                         """,
                         relation_id=row["relation_id"],
                     )
+
+            if episode_ids_to_remove:
+                await session.run(
+                    """
+                    MATCH (rel:Relation)
+                    WHERE rel.invalidated_by_episode_id IN $episode_ids
+                    SET rel.invalidated_by_episode_id = NULL,
+                        rel.updated_at = $updated_at
+                    """,
+                    episode_ids=episode_ids_to_remove,
+                    updated_at=_serialize_datetime(utc_now()),
+                )
 
             for label in ("Entity", "IdentityKey"):
                 id_field = "entity_id" if label == "Entity" else "key_id"
@@ -190,6 +239,16 @@ class Neo4jGraphStore:
                         )
                     if label == "Entity":
                         touched_entity_ids.add(row["node_id"])
+
+            if episode_ids_to_remove:
+                await session.run(
+                    """
+                    MATCH (ep:Episode)
+                    WHERE ep.episode_id IN $episode_ids
+                    DETACH DELETE ep
+                    """,
+                    episode_ids=episode_ids_to_remove,
+                )
         await self._cache_remove_memory(memory_id)
         if self.entity_index is not None and touched_entity_ids:
             entities_to_sync: list[GraphEntityNode] = []
@@ -285,11 +344,84 @@ class Neo4jGraphStore:
             return None
         return _entity_from_props(dict(row["e"]))
 
+    async def get_episode(self, episode_id: str) -> GraphEpisode | None:
+        await self._ensure_ready()
+        async with self.driver.session(database=self.database) as session:
+            result = await session.run(
+                """
+                MATCH (ep:Episode {episode_id: $episode_id})
+                RETURN ep
+                """,
+                episode_id=episode_id,
+            )
+            row = await result.single()
+        if row is None:
+            return None
+        return _episode_from_props(dict(row["ep"]))
+
+    async def find_facts(self, query: GraphFactQuery) -> list[GraphRelationEdge]:
+        await self._ensure_ready()
+        async with self.driver.session(database=self.database) as session:
+            result = await session.run(
+                """
+                MATCH (source:Entity)-[:OUTBOUND_RELATION]->(rel:Relation)-[:TARGETS]->(target:Entity)
+                WHERE (
+                    size($relation_types) = 0 OR rel.relation_type IN $relation_types
+                )
+                AND (
+                    size($source_entity_ids) = 0 OR source.entity_id IN $source_entity_ids
+                )
+                AND (
+                    size($target_entity_ids) = 0 OR target.entity_id IN $target_entity_ids
+                )
+                AND (
+                    size($anchor_entity_ids) = 0
+                    OR source.entity_id IN $anchor_entity_ids
+                    OR target.entity_id IN $anchor_entity_ids
+                )
+                AND (
+                    $active_only = false OR rel.invalidated_by_episode_id IS NULL
+                )
+                AND (
+                    $valid_at_or_after IS NULL OR rel.invalid_at IS NULL OR rel.invalid_at >= $valid_at_or_after
+                )
+                AND (
+                    $valid_at_or_before IS NULL OR rel.valid_at IS NULL OR rel.valid_at <= $valid_at_or_before
+                )
+                RETURN source.entity_id AS source_entity_id,
+                       target.entity_id AS target_entity_id,
+                       rel
+                LIMIT $limit
+                """,
+                relation_types=[value.value for value in query.relation_types],
+                source_entity_ids=query.source_entity_ids,
+                target_entity_ids=query.target_entity_ids,
+                anchor_entity_ids=query.anchor_entity_ids,
+                active_only=query.active_only,
+                valid_at_or_after=_serialize_datetime(query.valid_at_or_after),
+                valid_at_or_before=_serialize_datetime(query.valid_at_or_before),
+                limit=max(query.max_results * 3, query.max_results),
+            )
+            matches: list[GraphRelationEdge] = []
+            async for row in result:
+                relation = _relation_from_props(dict(row["rel"]))
+                relation.source_entity_id = row["source_entity_id"]
+                relation.target_entity_id = row["target_entity_id"]
+                matches.append(relation)
+        ranked = sorted(
+            matches,
+            key=lambda relation: _score_fact_query_match(relation, query),
+            reverse=True,
+        )
+        return ranked[: query.max_results]
+
     async def close(self) -> None:
         if self.entity_index is not None:
             await self.entity_index.close()
         if self.adjudicator is not None:
             await self.adjudicator.close()
+        if self.fact_adjudicator is not None:
+            await self.fact_adjudicator.close()
         await self.driver.close()
 
     async def _ensure_ready(self) -> None:
@@ -301,6 +433,7 @@ class Neo4jGraphStore:
                 "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE",
                 "CREATE CONSTRAINT identity_key_unique IF NOT EXISTS FOR (k:IdentityKey) REQUIRE k.key_id IS UNIQUE",
                 "CREATE CONSTRAINT relation_id_unique IF NOT EXISTS FOR (r:Relation) REQUIRE r.relation_id IS UNIQUE",
+                "CREATE CONSTRAINT episode_id_unique IF NOT EXISTS FOR (ep:Episode) REQUIRE ep.episode_id IS UNIQUE",
                 "CREATE INDEX identity_key_type_idx IF NOT EXISTS FOR (k:IdentityKey) ON (k.key_type)",
                 "CREATE INDEX relation_type_idx IF NOT EXISTS FOR (r:Relation) ON (r.relation_type)",
             ):
@@ -432,6 +565,8 @@ class Neo4jGraphStore:
         self,
         session,
         *,
+        document: GraphDocument,
+        episode: GraphEpisode,
         memory_id: str,
         source_entity_id: str,
         target_entity_id: str,
@@ -441,16 +576,85 @@ class Neo4jGraphStore:
         valid_at,
         invalid_at,
         expires_at,
-    ) -> GraphRelationEdge:
+    ) -> tuple[GraphRelationEdge | None, list[str]]:
         relation_id = _deterministic_relation_id(
-            memory_id=memory_id,
             source_entity_id=source_entity_id,
             target_entity_id=target_entity_id,
             relation_type=relation_type,
             fact=fact,
+            valid_at=valid_at,
+            invalid_at=invalid_at,
+            expires_at=expires_at,
         )
         existing = await self._get_relation(session, relation_id)
         if existing is None:
+            pending = PendingFactContext(
+                relation_type=relation_type,
+                source_entity_id=source_entity_id,
+                source_entity_name=(await self.get_entity(source_entity_id)).canonical_name,
+                target_entity_id=target_entity_id,
+                target_entity_name=(await self.get_entity(target_entity_id)).canonical_name,
+                fact=fact,
+                confidence=confidence,
+                valid_at=valid_at,
+                invalid_at=invalid_at,
+                expires_at=expires_at,
+            )
+            candidates = await self.find_facts(
+                GraphFactQuery(
+                    anchor_entity_ids=[source_entity_id, target_entity_id],
+                    source_entity_ids=[source_entity_id],
+                    relation_types=sorted(
+                        compatible_relation_types(relation_type),
+                        key=lambda value: value.value,
+                    ),
+                    active_only=True,
+                    valid_at_or_after=valid_at,
+                    valid_at_or_before=invalid_at,
+                    max_results=8,
+                )
+            )
+            exact_duplicate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if exact_fact_signature(candidate) == exact_fact_signature(pending)
+                ),
+                None,
+            )
+            if exact_duplicate is not None:
+                exact_duplicate.memory_ids = list(dict.fromkeys([*exact_duplicate.memory_ids, memory_id]))
+                exact_duplicate.episode_ids = list(
+                    dict.fromkeys([*exact_duplicate.episode_ids, episode.episode_id])
+                )
+                exact_duplicate.updated_at = utc_now()
+                exact_duplicate.confidence = max(exact_duplicate.confidence, confidence)
+                await self._persist_relation(session, exact_duplicate)
+                await self._link_episode_to_relation(
+                    session,
+                    episode_id=episode.episode_id,
+                    relation_id=exact_duplicate.relation_id,
+                    edge_type="PRODUCED",
+                )
+                return exact_duplicate, []
+
+            action, resolved_edge, invalidated_ids = await self._maybe_invalidate_relations(
+                session=session,
+                document=document,
+                episode=episode,
+                pending=pending,
+                candidates=candidates,
+            )
+            if action == "discard":
+                return resolved_edge, invalidated_ids
+            if action == "merge" and resolved_edge is not None:
+                await self._link_episode_to_relation(
+                    session,
+                    episode_id=episode.episode_id,
+                    relation_id=resolved_edge.relation_id,
+                    edge_type="PRODUCED",
+                )
+                return resolved_edge, invalidated_ids
             relation = GraphRelationEdge(
                 relation_id=relation_id,
                 relation_type=relation_type,
@@ -458,22 +662,37 @@ class Neo4jGraphStore:
                 target_entity_id=target_entity_id,
                 fact=fact,
                 memory_ids=[memory_id],
+                episode_ids=[episode.episode_id],
                 confidence=confidence,
                 valid_at=valid_at,
                 invalid_at=invalid_at,
                 expires_at=expires_at,
             )
-        else:
-            relation = existing
-            relation.memory_ids = list(dict.fromkeys([*relation.memory_ids, memory_id]))
-            relation.updated_at = utc_now()
-            relation.confidence = max(relation.confidence, confidence)
-            relation.valid_at = relation.valid_at or valid_at
-            relation.invalid_at = invalid_at or relation.invalid_at
-            relation.expires_at = expires_at or relation.expires_at
+            await self._persist_relation(session, relation)
+            await self._link_episode_to_relation(
+                session,
+                episode_id=episode.episode_id,
+                relation_id=relation.relation_id,
+                edge_type="PRODUCED",
+            )
+            return relation, invalidated_ids
 
+        relation = existing
+        relation.memory_ids = list(dict.fromkeys([*relation.memory_ids, memory_id]))
+        relation.episode_ids = list(dict.fromkeys([*relation.episode_ids, episode.episode_id]))
+        relation.updated_at = utc_now()
+        relation.confidence = max(relation.confidence, confidence)
+        relation.valid_at = relation.valid_at or valid_at
+        relation.invalid_at = invalid_at or relation.invalid_at
+        relation.expires_at = expires_at or relation.expires_at
         await self._persist_relation(session, relation)
-        return relation
+        await self._link_episode_to_relation(
+            session,
+            episode_id=episode.episode_id,
+            relation_id=relation.relation_id,
+            edge_type="PRODUCED",
+        )
+        return relation, []
 
     async def _persist_entity(self, session, entity: GraphEntityNode) -> None:
         await session.run(
@@ -534,6 +753,42 @@ class Neo4jGraphStore:
             entity_id=entity_id,
         )
 
+    async def _persist_episode(self, session, episode: GraphEpisode) -> None:
+        await session.run(
+            """
+            MERGE (ep:Episode {episode_id: $episode_id})
+            SET ep.memory_id = $memory_id,
+                ep.source_type = $source_type,
+                ep.provenance_source_kind = $provenance_source_kind,
+                ep.provenance_source_id = $provenance_source_id,
+                ep.session_id = $session_id,
+                ep.task_id = $task_id,
+                ep.channel = $channel,
+                ep.created_at = $created_at,
+                ep.extracted_at = $extracted_at,
+                ep.extraction_confidence = $extraction_confidence,
+                ep.rationale = $rationale,
+                ep.source_excerpt = $source_excerpt,
+                ep.produced_relation_ids = $produced_relation_ids,
+                ep.invalidated_relation_ids = $invalidated_relation_ids
+            """,
+            episode_id=episode.episode_id,
+            memory_id=episode.memory_id,
+            source_type=episode.source_type,
+            provenance_source_kind=episode.provenance_source_kind,
+            provenance_source_id=episode.provenance_source_id,
+            session_id=episode.session_id,
+            task_id=episode.task_id,
+            channel=episode.channel,
+            created_at=_serialize_datetime(episode.created_at),
+            extracted_at=_serialize_datetime(episode.extracted_at),
+            extraction_confidence=episode.extraction_confidence,
+            rationale=episode.rationale,
+            source_excerpt=episode.source_excerpt,
+            produced_relation_ids=episode.produced_relation_ids,
+            invalidated_relation_ids=episode.invalidated_relation_ids,
+        )
+
     async def _persist_relation(self, session, relation: GraphRelationEdge) -> None:
         await session.run(
             """
@@ -541,12 +796,14 @@ class Neo4jGraphStore:
             SET rel.relation_type = $relation_type,
                 rel.fact = $fact,
                 rel.memory_ids = $memory_ids,
+                rel.episode_ids = $episode_ids,
                 rel.confidence = $confidence,
                 rel.created_at = coalesce(rel.created_at, $created_at),
                 rel.updated_at = $updated_at,
                 rel.valid_at = $valid_at,
                 rel.invalid_at = $invalid_at,
                 rel.expires_at = $expires_at,
+                rel.invalidated_by_episode_id = $invalidated_by_episode_id,
                 rel.source_entity_id = $source_entity_id,
                 rel.target_entity_id = $target_entity_id
             WITH rel
@@ -559,14 +816,36 @@ class Neo4jGraphStore:
             relation_type=relation.relation_type.value,
             fact=relation.fact,
             memory_ids=relation.memory_ids,
+            episode_ids=relation.episode_ids,
             confidence=relation.confidence,
             created_at=_serialize_datetime(relation.created_at),
             updated_at=_serialize_datetime(relation.updated_at),
             valid_at=_serialize_datetime(relation.valid_at),
             invalid_at=_serialize_datetime(relation.invalid_at),
             expires_at=_serialize_datetime(relation.expires_at),
+            invalidated_by_episode_id=relation.invalidated_by_episode_id,
             source_entity_id=relation.source_entity_id,
             target_entity_id=relation.target_entity_id,
+        )
+
+    async def _link_episode_to_relation(
+        self,
+        session,
+        *,
+        episode_id: str,
+        relation_id: str,
+        edge_type: str,
+    ) -> None:
+        if edge_type not in {"PRODUCED", "INVALIDATED"}:
+            raise ValueError(f"Unsupported episode edge type: {edge_type}")
+        await session.run(
+            f"""
+            MATCH (ep:Episode {{episode_id: $episode_id}})
+            MATCH (rel:Relation {{relation_id: $relation_id}})
+            MERGE (ep)-[:{edge_type}]->(rel)
+            """,
+            episode_id=episode_id,
+            relation_id=relation_id,
         )
 
     async def _lookup_keys(self, session, keys: list[GraphIdentityKey]) -> dict[str, dict[str, object]]:
@@ -602,6 +881,114 @@ class Neo4jGraphStore:
         if row is None:
             return None
         return _relation_from_props(dict(row["rel"]))
+
+    async def _maybe_invalidate_relations(
+        self,
+        *,
+        session,
+        document: GraphDocument,
+        episode: GraphEpisode,
+        pending: PendingFactContext,
+        candidates: list[GraphRelationEdge],
+    ) -> tuple[str, GraphRelationEdge | None, list[str]]:
+        if not candidates:
+            return "create", None, []
+
+        deterministic_invalidated_ids = _deterministic_invalidation_candidate_ids(
+            pending=pending,
+            candidates=candidates,
+            pending_effective_valid_at=pending.valid_at or episode.created_at,
+        )
+        if deterministic_invalidated_ids:
+            for relation_id in deterministic_invalidated_ids:
+                relation = await self._get_relation(session, relation_id)
+                if relation is None or not _is_active_relation(relation):
+                    continue
+                relation.invalidated_by_episode_id = episode.episode_id
+                relation.updated_at = utc_now()
+                await self._persist_relation(session, relation)
+                await self._link_episode_to_relation(
+                    session,
+                    episode_id=episode.episode_id,
+                    relation_id=relation.relation_id,
+                    edge_type="INVALIDATED",
+                )
+            return "create", None, deterministic_invalidated_ids
+
+        candidate_contexts = []
+        for candidate in candidates:
+            source = await self.get_entity(candidate.source_entity_id)
+            target = await self.get_entity(candidate.target_entity_id)
+            candidate_contexts.append(
+                FactCandidateContext(
+                    relation_id=candidate.relation_id,
+                    relation_type=candidate.relation_type,
+                    source_entity_id=candidate.source_entity_id,
+                    source_entity_name=source.canonical_name if source is not None else candidate.source_entity_id,
+                    target_entity_id=candidate.target_entity_id,
+                    target_entity_name=target.canonical_name if target is not None else candidate.target_entity_id,
+                    fact=candidate.fact,
+                    confidence=candidate.confidence,
+                    memory_count=len(candidate.memory_ids),
+                    episode_count=len(candidate.episode_ids),
+                    valid_at=candidate.valid_at,
+                    invalid_at=candidate.invalid_at,
+                    expires_at=candidate.expires_at,
+                    active=_is_active_relation(candidate),
+                    retrieval_reason="active_relation_family_candidate",
+                )
+            )
+        if self.fact_adjudicator is None:
+            return "create", None, []
+
+        timezone_name = getattr(self.fact_adjudicator, "timezone_name", "UTC")
+        try:
+            decision = await self.fact_adjudicator.adjudicate(
+                FactAdjudicationRequest(
+                    memory_id=document.memory_id,
+                    episode=episode,
+                    pending_fact=pending,
+                    candidate_facts=candidate_contexts,
+                    source_text=document.source_text,
+                    utc_time_anchor=utc_now(),
+                    local_time_anchor=build_local_time_anchor(timezone_name).isoformat(),
+                    provenance_created_at=episode.created_at,
+                    timezone_name=timezone_name,
+                )
+            )
+        except Exception:
+            logger.exception("Fact adjudication failed for memory %s", document.memory_id)
+            return "create", None, []
+
+        if decision.decision == "discard_new":
+            return "discard", None, []
+        if decision.decision == "merge_with_existing" and decision.chosen_relation_id:
+            existing = await self._get_relation(session, decision.chosen_relation_id)
+            if existing is not None:
+                existing.memory_ids = list(dict.fromkeys([*existing.memory_ids, document.memory_id]))
+                existing.episode_ids = list(dict.fromkeys([*existing.episode_ids, episode.episode_id]))
+                existing.updated_at = utc_now()
+                await self._persist_relation(session, existing)
+                return "merge", existing, []
+        if decision.decision != "invalidate_existing":
+            return "create", None, []
+
+        invalidated_ids: list[str] = []
+        for relation_id in decision.invalidated_relation_ids:
+            relation = await self._get_relation(session, relation_id)
+            if relation is None or not _is_active_relation(relation):
+                continue
+            relation.invalidated_by_episode_id = episode.episode_id
+            relation.updated_at = utc_now()
+            await self._persist_relation(session, relation)
+            await self._link_episode_to_relation(
+                session,
+                episode_id=episode.episode_id,
+                relation_id=relation.relation_id,
+                edge_type="INVALIDATED",
+            )
+            invalidated_ids.append(relation.relation_id)
+        return "create", None, invalidated_ids
 
     async def _load_search_store(self) -> InMemoryGraphStore:
         await self._ensure_ready()
@@ -676,7 +1063,19 @@ class Neo4jGraphStore:
                     relation.relation_id
                 )
 
+            episode_result = await session.run(
+                """
+                MATCH (ep:Episode)
+                RETURN ep
+                """
+            )
+            episodes: dict[str, GraphEpisode] = {}
+            async for row in episode_result:
+                episode = _episode_from_props(dict(row["ep"]))
+                episodes[episode.episode_id] = episode
+
         store._entities = entities
+        store._episodes = episodes
         store._identity_keys = identity_keys
         store._relations = relations
         store._key_to_entities = defaultdict(set, key_to_entities)
@@ -685,7 +1084,7 @@ class Neo4jGraphStore:
 
     async def _cache_ingest_document(self, document: GraphDocument) -> None:
         async with self._cache_lock:
-            if self.adjudicator is not None:
+            if self.adjudicator is not None or self.fact_adjudicator is not None:
                 self._search_cache = None
                 return
             if self._search_cache is None:
@@ -695,7 +1094,7 @@ class Neo4jGraphStore:
 
     async def _cache_remove_memory(self, memory_id: str) -> None:
         async with self._cache_lock:
-            if self.adjudicator is not None:
+            if self.adjudicator is not None or self.fact_adjudicator is not None:
                 self._search_cache = None
                 return
             if self._search_cache is None:
@@ -1027,12 +1426,34 @@ def _relation_from_props(props: dict) -> GraphRelationEdge:
         target_entity_id=props.get("target_entity_id", ""),
         fact=props["fact"],
         memory_ids=list(props.get("memory_ids") or []),
+        episode_ids=list(props.get("episode_ids") or []),
         confidence=float(props.get("confidence") or 1.0),
         created_at=_deserialize_datetime(props.get("created_at")) or utc_now(),
         updated_at=_deserialize_datetime(props.get("updated_at")) or utc_now(),
         valid_at=_deserialize_datetime(props.get("valid_at")),
         invalid_at=_deserialize_datetime(props.get("invalid_at")),
         expires_at=_deserialize_datetime(props.get("expires_at")),
+        invalidated_by_episode_id=props.get("invalidated_by_episode_id"),
+    )
+
+
+def _episode_from_props(props: dict) -> GraphEpisode:
+    return GraphEpisode(
+        episode_id=props["episode_id"],
+        memory_id=props["memory_id"],
+        source_type=props["source_type"],
+        provenance_source_kind=props.get("provenance_source_kind"),
+        provenance_source_id=props.get("provenance_source_id"),
+        session_id=props.get("session_id"),
+        task_id=props.get("task_id"),
+        channel=props.get("channel"),
+        created_at=_deserialize_datetime(props.get("created_at")) or utc_now(),
+        extracted_at=_deserialize_datetime(props.get("extracted_at")) or utc_now(),
+        extraction_confidence=float(props.get("extraction_confidence") or 1.0),
+        rationale=props.get("rationale"),
+        source_excerpt=props.get("source_excerpt"),
+        produced_relation_ids=list(props.get("produced_relation_ids") or []),
+        invalidated_relation_ids=list(props.get("invalidated_relation_ids") or []),
     )
 
 
@@ -1074,12 +1495,112 @@ def _deserialize_json(value) -> dict:
 
 def _deterministic_relation_id(
     *,
-    memory_id: str,
     source_entity_id: str,
     target_entity_id: str,
     relation_type: RelationType,
     fact: str,
+    valid_at,
+    invalid_at,
+    expires_at,
 ) -> str:
-    payload = "||".join([memory_id, source_entity_id, target_entity_id, relation_type.value, fact])
+    payload = "||".join(
+        [
+            source_entity_id,
+            target_entity_id,
+            relation_type.value,
+            fact,
+            valid_at.isoformat() if valid_at is not None else "",
+            invalid_at.isoformat() if invalid_at is not None else "",
+            expires_at.isoformat() if expires_at is not None else "",
+        ]
+    )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"rel_{digest[:24]}"
+
+
+def _coerce_episode(document: GraphDocument) -> GraphEpisode:
+    episode = document.episode
+    if episode is None:
+        episode = GraphEpisode(
+            memory_id=document.memory_id,
+            source_type="unknown",
+            created_at=document.created_at,
+        )
+    if not episode.source_excerpt:
+        episode.source_excerpt = _excerpt(document.source_text)
+    return episode
+
+
+def _excerpt(value: str | None, *, limit: int = 280) -> str | None:
+    if not value:
+        return None
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 3].rstrip()}..."
+
+
+def _deterministic_invalidation_candidate_ids(
+    *,
+    pending: PendingFactContext,
+    candidates: list[GraphRelationEdge],
+    pending_effective_valid_at,
+) -> list[str]:
+    if pending_effective_valid_at is None:
+        return []
+
+    invalidated_ids: list[str] = []
+    pending_fact_key = " ".join(pending.fact.casefold().split())
+    for candidate in candidates:
+        if candidate.invalidated_by_episode_id is not None:
+            continue
+        if candidate.relation_type != pending.relation_type:
+            continue
+        if candidate.source_entity_id != pending.source_entity_id:
+            continue
+        if candidate.target_entity_id != pending.target_entity_id:
+            continue
+
+        candidate_effective_valid_at = candidate.valid_at or candidate.updated_at or candidate.created_at
+        if candidate_effective_valid_at is None:
+            continue
+        if pending_effective_valid_at <= candidate_effective_valid_at:
+            continue
+
+        candidate_fact_key = " ".join(candidate.fact.casefold().split())
+        if candidate_fact_key == pending_fact_key:
+            continue
+
+        invalidated_ids.append(candidate.relation_id)
+    return invalidated_ids
+
+
+def _is_active_relation(relation: GraphRelationEdge) -> bool:
+    now = utc_now()
+    if relation.invalidated_by_episode_id is not None:
+        return False
+    if relation.invalid_at and relation.invalid_at <= now:
+        return False
+    if relation.expires_at and relation.expires_at <= now:
+        return False
+    return True
+
+
+def _score_fact_query_match(relation: GraphRelationEdge, query: GraphFactQuery) -> float:
+    score = 0.0
+    anchor_ids = set(query.anchor_entity_ids)
+    if relation.source_entity_id in anchor_ids:
+        score += 0.6
+    if relation.target_entity_id in anchor_ids:
+        score += 0.45
+    if query.source_entity_ids and relation.source_entity_id in set(query.source_entity_ids):
+        score += 0.8
+    if query.target_entity_ids and relation.target_entity_id in set(query.target_entity_ids):
+        score += 0.6
+    if query.relation_types and relation.relation_type in set(query.relation_types):
+        score += 0.35
+    if _is_active_relation(relation):
+        score += 0.2
+    score += min(max(relation.confidence, 0.0), 1.0) * 0.05
+    score += len(relation.episode_ids) * 0.01
+    return score

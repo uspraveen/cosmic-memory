@@ -21,6 +21,7 @@ The app-factory split is now explicit:
 This repository owns:
 
 - canonical long-term memory records,
+- runtime observation ingestion into canonical episode/transcript records,
 - `memory_id` lifecycle,
 - passive recall contracts,
 - active memory search and traversal contracts,
@@ -97,6 +98,11 @@ The current codebase now includes the first graph layer needed to support this:
 - entity-level vector candidate generation over canonical names, aliases, and attributes,
 - write-time LLM extraction into canonical `graph_document` payloads,
 - internal LLM adjudication for ambiguous entity creation and merging,
+- first-class graph episodes carrying source excerpt, timestamps, extraction confidence, and relation lineage,
+- structured active-fact lookup over entity ids, compatible relation families, active-state filters, and time windows,
+- on-ingest fact invalidation for ambiguous current-state conflicts,
+- internal graph retrieval recipes for passive and active graph-backed recall,
+- a first-class observation ingestion path for transcript/episode records,
 - one-hop graph-assisted passive recall,
 - graph-first active traversal when a graph store is attached.
 
@@ -108,7 +114,25 @@ graph-dominant:
 - strict token-budget packing before prompt assembly,
 - optional entity-similarity lookup for indirect graph seed generation,
 - shallow graph assist only when the query looks relationship-heavy,
+- passive graph hits are post-processed through a cheap recipe layer using RRF, node-distance, and episode-mention signals,
 - bounded graph wait time so passive recall does not stall on traversal work.
+
+The active path now has its own recipe layer:
+
+- graph traversal produces candidate relations, entities, episodes, and supporting memories,
+- an internal active recipe reranks those relations with:
+  - lexical/query relevance
+  - current-vs-historical state alignment
+  - node distance from seeded entities
+  - episode support and recency
+  - MMR diversification to avoid repeated near-duplicate relations
+- supporting memory ids are then ranked from the selected relation set before canonical record hydration
+
+The recipe layer is intentionally hybrid rather than pure-RRF:
+
+- weighted signal scores remain the main driver for interpretability,
+- RRF now has explicit weight and scale so it contributes materially instead of acting as a decorative tiebreaker,
+- MMR is only used on active traversal, not on passive graph assist.
 
 ## Storage Direction
 
@@ -136,14 +160,151 @@ When graph extraction is enabled, canonical write flow becomes:
 1. write request enters the memory service,
 2. an LLM extracts entities, identity candidates, aliases, typed relations, and temporal fields,
 3. the extraction result is deduplicated and normalized locally,
-4. ambiguous entity candidates can be passed to an internal adjudicator,
-5. the normalized `graph_document` is written back into canonical Markdown metadata,
-6. the same normalized document is ingested into the graph projection,
-7. changed entities are synced into the entity-similarity index,
-8. the passive index is updated independently.
+4. the memory layer creates or updates a first-class graph episode for provenance,
+5. ambiguous entity candidates can be passed to an internal adjudicator,
+6. candidate active facts are retrieved from the graph using a structured fact query,
+7. ambiguous fact conflicts can be passed to an internal fact adjudicator,
+8. the normalized `graph_document` is written back into canonical Markdown metadata,
+9. the same normalized document is ingested into the graph projection,
+10. changed entities are synced into the entity-similarity index,
+11. the passive index is updated independently.
 
 This keeps graph intelligence on the ingestion side and keeps passive recall
 free of query-time LLM latency.
+
+There is now also a runtime observation-ingestion path:
+
+- Gateway/orchestrator can send one or more conversation/task observations through `ingest_episode(...)`
+- `cosmic-memory` renders them into a canonical transcript-style record
+- transcript ingestion can opt into graph extraction explicitly, even though transcript memories are not extracted by default
+- the same canonical-write, graph-ingest, and passive-index sync path is then reused
+
+This is the missing bridge between live Cosmic runtime events and the long-term
+memory subsystem.
+
+## Episode And Fact Model
+
+Graphiti-style provenance is now treated as a first-class requirement rather
+than an implementation detail.
+
+Each ingested graph document can produce:
+
+- one `episode`
+  - `episode_id`
+  - `memory_id`
+  - source type and provenance identifiers
+  - `created_at`
+  - `extracted_at`
+  - extraction confidence
+  - source excerpt
+  - produced relation ids
+  - invalidated relation ids
+- one or more graph relations
+  - each relation stores its contributing `episode_ids`
+  - each invalidated relation stores `invalidated_by_episode_id`
+
+This is important because invalidation is not just a graph mutation. It is a
+lineage event: a later episode caused an earlier active fact to stop being
+current.
+
+## Structured Fact Lookup
+
+Fact invalidation depends on a dedicated graph-store primitive rather than
+generic traversal plus client-side filtering.
+
+The graph store now exposes a structured fact query that can filter by:
+
+- anchor entity ids
+- explicit source entity ids
+- explicit target entity ids
+- compatible relation families
+- active-only state
+- optional time window
+
+That query is used in two places:
+
+- ingestion-time invalidation candidate retrieval
+- future agent/orchestrator current-state and temporal tools
+
+This keeps the invalidation pipeline attached to the right abstraction and
+makes it easier to optimize both the in-memory and Neo4j backends.
+
+## Invalidation Model
+
+Fact invalidation is primarily a write-time concern, not a cron concern.
+
+When a new graph fact is ingested:
+
+1. deterministic duplicate checks run first
+2. active compatible facts are retrieved through the structured fact query
+3. if needed, an internal fact adjudicator reasons over the pending fact, the
+   active candidates, their episodes, and the time anchors
+4. the system decides whether to:
+   - keep both
+   - merge with an existing relation
+   - invalidate one or more existing active relations
+   - discard the new fact
+5. invalidated relations are marked with `invalidated_by_episode_id`
+6. current-state traversal excludes invalidated relations by default
+
+Periodic consolidation is still useful later, but the main correctness path is
+on ingestion so the graph does not remain stale between writes.
+
+There is also a deterministic fallback before the LLM adjudicator:
+
+- if the pending fact is a later update for the same source entity, target
+  entity, and relation type,
+- and the earlier fact is still active,
+- and the fact text is not an exact duplicate,
+
+then the older relation can be invalidated immediately without paying LLM
+latency.
+
+## Query Semantics
+
+The graph fact query is intentionally explicit:
+
+- `source_entity_ids`
+  - directional filter on the relation source side only
+- `target_entity_ids`
+  - directional filter on the relation target side only
+- `anchor_entity_ids`
+  - undirected anchor filter; a relation matches if the entity appears on either side
+
+Traversal also has an explicit current-vs-historical split:
+
+- `prefer_current_state=true`
+  - favor active/current facts and suppress invalidated relations where possible
+- `prefer_current_state=false`
+  - allow broader historical traversal, including invalidated relations when relevant
+- `relation_distances`
+  - 1-indexed hop counts from the nearest seed entity
+  - direct seed-adjacent relations have distance `1`
+
+## Retrieval Recipes
+
+This repo now has an internal recipe layer inspired by Graphiti's search
+recipes, but kept intentionally cheaper and narrower for Cosmic's current
+stage.
+
+The implemented recipes today are:
+
+- passive graph assist
+  - `passive_hybrid_rrf`
+  - uses a weighted hybrid of lexical relevance, state alignment, node distance, episode support, and materially scaled RRF
+  - no MMR because passive recall is latency-sensitive and only needs a bounded boost set
+- active current-state traversal
+  - `active_current_state_rrf_mmr`
+  - uses the same hybrid scoring plus MMR diversification
+- active temporal traversal
+  - `active_temporal_rrf_mmr`
+  - biases more toward episode support and historical state
+- active generic traversal
+  - `active_hybrid_rrf_mmr`
+
+These recipes are internal. They are not public API yet. The service layer
+selects them automatically from the query frame and uses them to reorder graph
+results and supporting canonical memories before building the final response.
 
 Entity candidate resolution is intentionally layered:
 

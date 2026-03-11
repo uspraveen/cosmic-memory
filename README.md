@@ -94,13 +94,39 @@ sequenceDiagram
         CM->>X: extract entities / relations / time anchors
         X-->>CM: graph_document
         CM->>MD: write normalized graph metadata
+        CM->>CM: build episode provenance record
         CM->>A: adjudicate ambiguous entity merges
         A-->>CM: merge / candidate / create_new
+        CM->>G: find active compatible facts
+        G-->>CM: candidate active facts + episode lineage
+        CM->>A: adjudicate ambiguous fact invalidation
+        A-->>CM: keep_both / merge / invalidate_existing / discard_new
         CM->>G: ingest graph_document
         G->>EI: sync changed entities
     end
     CM->>Q: upsert passive memory point
     CM-->>GW: MemoryRecord + memory_id
+```
+
+### Observation Ingestion
+
+```mermaid
+sequenceDiagram
+    participant GW as Gateway / Orchestrator
+    participant CM as cosmic-memory
+    participant MD as Markdown Store
+    participant G as Graph Store
+    participant Q as Qdrant
+
+    GW->>CM: ingest_episode(observations)
+    CM->>CM: render transcript / observation record
+    CM->>MD: write canonical transcript .md
+    alt extract_graph enabled
+        CM->>CM: optionally extract graph_document
+        CM->>G: ingest graph episode + facts
+    end
+    CM->>Q: sync passive index
+    CM-->>GW: record + graph_episode_id
 ```
 
 ### Passive And Active Retrieval
@@ -114,8 +140,9 @@ flowchart TD
     PASS --> RERANK[Multi-factor reranking<br/>type + recency + identity + current-state + token cost]
     PASS --> GSEED[Optional graph seed generation<br/>exact identities + entity similarity]
     GSEED --> G1[Shallow graph assist<br/>1-hop, timeout bounded]
+    G1 --> GRECIPE[Passive graph recipe<br/>RRF + node distance + episode mentions]
     MEMQ --> RERANK
-    G1 --> RERANK
+    GRECIPE --> RERANK
     RERANK --> PACK[Token-budget packing]
     PACK --> CTX[Prompt context for every LLM call]
 
@@ -124,7 +151,8 @@ flowchart TD
     ACTIVE --> PLAN[Agent/orchestrator memory plan]
     PLAN --> TOOLS[resolve_identity / current_state / temporal_facts / traverse / memory_brief]
     TOOLS --> GRAPH[Multi-hop graph + memory evidence]
-    GRAPH --> BRIEF[Structured memory brief]
+    GRAPH --> ARECIPE[Active graph recipe<br/>RRF + node distance + episode mentions + MMR]
+    ARECIPE --> BRIEF[Structured memory brief]
     DECIDE -->|No| CTX
 ```
 
@@ -146,11 +174,17 @@ The current milestone in this repo provides:
 - graph ontology and deterministic identity normalization foundations,
 - write-time xAI graph extraction with structured output support,
 - internal xAI-backed entity adjudication for ambiguous graph writes,
+- internal xAI-backed fact adjudication for ambiguous active-fact invalidation,
 - document-level graph dedup normalization before graph ingest,
 - a dedicated entity-similarity index for entity candidate generation and graph seeding,
+- first-class graph episodes for provenance and lineage,
+- structured active-fact lookup for compatible entities, relations, and time windows,
+- on-ingest fact invalidation that keeps stale facts out of current-state traversal,
+- internal graph retrieval recipes for passive and active graph-backed recall,
 - graph-assisted passive recall and graph-first active recall when a graph store is attached,
 - a compact agent/orchestrator memory control surface,
 - schema injection, query planning, identity resolution, current-state lookup, temporal fact lookup, and structured memory briefs,
+- a first-class `ingest_episode(...)` path for turning runtime observations into canonical transcript memories,
 - a thin FastAPI server,
 - an in-memory development implementation for contract testing.
 
@@ -239,6 +273,12 @@ Relevant environment variables:
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_RETRIES` (default `3`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_BASE_SECONDS` (default `1.0`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_ENABLED` (default `true` when `XAI_API_KEY` is present)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MODEL` (default `grok-4-1-fast-reasoning`)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MAX_PARALLEL` (default `2`)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MAX_RETRIES` (default `3`)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_BASE_SECONDS` (default `1.0`)
+- `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_MAX_SECONDS` (default `12.0`)
 - `COSMIC_MEMORY_TIMEZONE` (default `UTC`)
 - `COSMIC_MEMORY_ENV_FILE` (default `.env`)
 
@@ -263,10 +303,22 @@ Graph notes:
 - entity similarity uses a separate Qdrant collection and the same Perplexity embedding model as passive memory,
 - vector similarity is only used for shortlist generation after exact identity and normalized-name checks,
 - ambiguous entity creation and merge decisions can be escalated to an internal xAI adjudicator,
+- ambiguous active-fact conflicts can be escalated to an internal xAI fact adjudicator,
 - ambiguous similarity hits become provisional `candidate_match` results instead of silent auto-merges,
 - write-time extraction stores normalized `graph_document` payloads back into canonical Markdown,
+- every ingested graph document now produces a first-class `episode` with source excerpt, timestamps, extraction confidence, and lineage to produced/invalidated relations,
+- graph stores expose structured active-fact lookup internally by entity ids, compatible relation families, active-state filter, and time window,
+- fact invalidation runs on ingestion, not on cron, so current-state traversal does not leak stale facts between writes,
+- there is now a deterministic invalidation fallback for obvious same-pair, same-relation updates with a newer valid time, even when the LLM fact adjudicator is off,
+- `GraphFactQuery.source_entity_ids` and `target_entity_ids` are directional filters, while `anchor_entity_ids` match either side of a relation,
+- `prefer_current_state=false` is a historical traversal mode and may surface invalidated relations intentionally,
+- graph search results are now passed through internal recipes before memory hydration:
+  - passive graph assist uses a cheap hybrid recipe where RRF materially contributes alongside lexical/state/node-distance/episode signals,
+  - active traversal uses the same hybrid scoring plus MMR diversification to avoid repeating near-duplicate relations,
+- `relation_distances` in graph results are explicitly 1-indexed hop counts from the nearest seed entity,
 - extraction prompts are explicitly time-aware and resolve relative dates against UTC and local timezone anchors,
 - passive graph seeding can use the entity-similarity index to resolve indirect references like `todo` -> `task`,
+- transcript observations can opt into graph extraction through `ingest_episode(...)` even though transcript memories are not extracted by default,
 - current graph backend support in the app factory is intentionally limited to:
   - `memory` for local/dev validation
   - `neo4j` as the first persistent backend boundary
@@ -285,6 +337,7 @@ Current server endpoints:
 | `GET` | `/health` | Health/status check for the service. | Infra, local dev, Gateway | Not memory-specific. |
 | `POST` | `/v1/embeddings/generate` | Generate dense embeddings through the configured embedding backend. | Internal tooling, diagnostics, future batch jobs | Not on the normal recall hot path. |
 | `POST` | `/v1/memories` | Write a canonical long-term memory record. | Gateway, agents, orchestrator | Canonical `.md` write path. |
+| `POST` | `/v1/episodes` | Turn runtime observations into a canonical transcript/episode record. | Gateway, orchestrator | High-level observation ingestion path. Can optionally trigger graph extraction. |
 | `GET` | `/v1/memories/{memory_id}` | Fetch one canonical memory by ID. | Gateway, agents, orchestrator | Direct record lookup. |
 | `POST` | `/v1/memories/{memory_id}/supersede` | Supersede an existing memory with a replacement record. | Gateway, agents, consolidation jobs | Preserves history instead of blind overwrite. |
 | `POST` | `/v1/core-facts` | Write a first-class `core_fact` record. | Gateway, profile updates, agents | Supports `canonical_key`-based supersession. |
@@ -308,6 +361,13 @@ Index behavior is aligned with the current Cosmic architecture:
 - Qdrant is treated as a rebuildable passive index,
 - startup sync can repair registry/index drift from canonical files,
 - passive recall enforces a fixed token budget before returning memories.
+
+Graph behavior follows the same pattern:
+
+- canonical Markdown stays authoritative,
+- graph episodes and relations are projections derived from canonical memories,
+- ambiguous entity creation and fact invalidation stay inside `cosmic-memory`,
+- active-state graph queries prefer current facts and exclude invalidated facts by default.
 
 ## Agent Control Surface
 
@@ -339,6 +399,7 @@ agent to relearn the ontology, traversal strategy, and ranking heuristics.
 ## Near-Term Plan
 
 1. Integrate passive recall with Cosmic Gateway session assembly.
-2. Wire the new control surface into Gateway and orchestrator memory tooling.
-3. Add consolidation and conflict-resolution jobs.
-4. Add extraction queues, caches, and production observability.
+2. Wire `ingest_episode(...)` into Gateway session/task observation flow.
+3. Wire the new control surface into Gateway and orchestrator memory tooling.
+4. Add consolidation and conflict-resolution jobs.
+5. Add extraction queues, caches, and production observability.

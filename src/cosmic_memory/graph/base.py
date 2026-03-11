@@ -7,9 +7,12 @@ from typing import Protocol
 from cosmic_memory.graph.models import (
     GraphDocument,
     GraphEntityNode,
+    GraphEpisode,
+    GraphFactQuery,
     GraphIdentityCandidate,
     GraphIngestResult,
     GraphQueryFrame,
+    GraphRelationEdge,
     GraphSearchResult,
     IdentityResolutionResult,
 )
@@ -43,3 +46,7 @@ class GraphStore(Protocol):
     ) -> GraphSearchResult: ...
 
     async def get_entity(self, entity_id: str) -> GraphEntityNode | None: ...
+
+    async def get_episode(self, episode_id: str) -> GraphEpisode | None: ...
+
+    async def find_facts(self, query: GraphFactQuery) -> list[GraphRelationEdge]: ...

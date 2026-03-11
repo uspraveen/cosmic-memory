@@ -51,6 +51,7 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
             database: str,
             entity_index,
             adjudicator,
+            fact_adjudicator,
         ) -> None:
             captured["uri"] = uri
             captured["username"] = username
@@ -58,6 +59,7 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
             captured["database"] = database
             captured["entity_index"] = entity_index
             captured["adjudicator"] = adjudicator
+            captured["fact_adjudicator"] = fact_adjudicator
 
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
     monkeypatch.setenv("COSMIC_MEMORY_ENTITY_INDEX_ENABLED", "false")
@@ -77,6 +79,7 @@ def test_build_graph_store_can_construct_neo4j_backend(monkeypatch: pytest.Monke
         "database": "neo4j",
         "entity_index": None,
         "adjudicator": None,
+        "fact_adjudicator": None,
     }
 
 

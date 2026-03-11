@@ -21,7 +21,9 @@ from cosmic_memory.domain.models import (
     ActiveRecallRequest,
     ActiveRecallResponse,
     CoreFactBlock,
+    EpisodeIngestResponse,
     HealthStatus,
+    IngestEpisodeRequest,
     IndexStatusResponse,
     IndexSyncResponse,
     MemoryRecord,
@@ -39,6 +41,8 @@ class MemoryService(Protocol):
     async def health(self) -> HealthStatus: ...
 
     async def write(self, request: WriteMemoryRequest) -> MemoryRecord: ...
+
+    async def ingest_episode(self, request: IngestEpisodeRequest) -> EpisodeIngestResponse: ...
 
     async def write_core_fact(self, request: WriteCoreFactRequest) -> MemoryRecord: ...
 

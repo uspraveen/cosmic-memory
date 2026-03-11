@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 
 from cosmic_memory.domain.models import (
     EmbeddingItem,
@@ -8,8 +9,10 @@ from cosmic_memory.domain.models import (
 from cosmic_memory.graph import (
     EntityAdjudicationDecision,
     EntityType,
+    FactAdjudicationDecision,
     GraphDocument,
     GraphDocumentEntity,
+    GraphFactQuery,
     GraphDocumentRelation,
     GraphIdentityCandidate,
     IdentityKeyType,
@@ -67,6 +70,22 @@ class FakeEntityAdjudicator:
         self.requests = []
 
     async def adjudicate(self, request) -> EntityAdjudicationDecision:
+        self.requests.append(request)
+        return self.decision
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeFactAdjudicator:
+    model_name = "fake-fact-adjudicator"
+    timezone_name = "UTC"
+
+    def __init__(self, decision: FactAdjudicationDecision) -> None:
+        self.decision = decision
+        self.requests = []
+
+    async def adjudicate(self, request) -> FactAdjudicationDecision:
         self.requests.append(request)
         return self.decision
 
@@ -477,5 +496,306 @@ def test_passive_and_active_search_ignore_stale_entity_index_hits():
         assert active.entities
         assert all(entity.entity_id != "ent_missing_from_graph" for entity in passive.entities)
         assert all(entity.entity_id != "ent_missing_from_graph" for entity in active.entities)
+
+    asyncio.run(run())
+
+
+def test_graph_store_can_find_active_facts_with_structured_query():
+    async def run():
+        store = InMemoryGraphStore()
+        ingest = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_fact_query",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="task",
+                        entity_type=EntityType.TASK,
+                        canonical_name="Roadmap task",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="task",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Roadmap task is blocked by embedding latency.",
+                    )
+                ],
+                source_text="Roadmap task is blocked by embedding latency.",
+            )
+        )
+
+        facts = await store.find_facts(
+            GraphFactQuery(
+                source_entity_ids=[ingest.entity_ids[0]],
+                relation_types=[RelationType.BLOCKED_BY],
+                active_only=True,
+            )
+        )
+
+        assert facts
+        assert facts[0].relation_type == RelationType.BLOCKED_BY
+        assert facts[0].episode_ids
+
+    asyncio.run(run())
+
+
+def test_graph_fact_query_anchor_ids_match_either_relation_side():
+    async def run():
+        store = InMemoryGraphStore()
+        ingest = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_anchor_query",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="owner",
+                        entity_type=EntityType.PERSON,
+                        canonical_name="Nitin Agarwal",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="owner",
+                        target_ref="project",
+                        relation_type=RelationType.WORKS_ON,
+                        fact="Nitin Agarwal works on Cosmic Memory.",
+                    )
+                ],
+                source_text="Nitin Agarwal works on Cosmic Memory.",
+            )
+        )
+
+        directional = await store.find_facts(
+            GraphFactQuery(
+                source_entity_ids=[ingest.entity_ids[0]],
+                relation_types=[RelationType.WORKS_ON],
+            )
+        )
+        anchored = await store.find_facts(
+            GraphFactQuery(
+                anchor_entity_ids=[ingest.entity_ids[0]],
+                relation_types=[RelationType.WORKS_ON],
+            )
+        )
+
+        assert directional == []
+        assert anchored
+        assert anchored[0].relation_type == RelationType.WORKS_ON
+
+    asyncio.run(run())
+
+
+def test_graph_store_records_episode_provenance_on_ingest():
+    async def run():
+        store = InMemoryGraphStore()
+        result = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_episode",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="project",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Cosmic Memory is blocked by embedding latency.",
+                        confidence=0.88,
+                    )
+                ],
+                source_text="Cosmic Memory is blocked by embedding latency.",
+            )
+        )
+
+        assert result.episode_id is not None
+        episode = await store.get_episode(result.episode_id)
+        assert episode is not None
+        assert episode.memory_id == "mem_episode"
+        assert episode.produced_relation_ids == result.relation_ids
+        assert episode.source_excerpt
+
+        active = await store.traverse(build_query_frame("What is blocking Cosmic Memory right now?"))
+        assert active.episodes
+        assert active.episodes[0].episode_id == episode.episode_id
+
+    asyncio.run(run())
+
+
+def test_graph_store_can_deterministically_invalidate_later_same_pair_fact_without_llm():
+    async def run():
+        store = InMemoryGraphStore()
+        earlier = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        later = datetime(2026, 3, 2, tzinfo=timezone.utc)
+
+        first = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_old_pair_fact",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="project",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Cosmic Memory is blocked by embedding latency in staging.",
+                        valid_at=earlier,
+                    )
+                ],
+                source_text="Cosmic Memory is blocked by embedding latency in staging.",
+            )
+        )
+        old_relation_id = first.relation_ids[0]
+
+        second = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_new_pair_fact",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="project",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Cosmic Memory is blocked by embedding latency after the migration.",
+                        valid_at=later,
+                    )
+                ],
+                source_text="Cosmic Memory is blocked by embedding latency after the migration.",
+            )
+        )
+
+        assert second.invalidated_relation_ids == [old_relation_id]
+        old_relation = store._relations[old_relation_id]
+        assert old_relation.invalidated_by_episode_id == second.episode_id
+
+        current = await store.traverse(build_query_frame("What is blocking Cosmic Memory right now?"))
+        assert current.relations
+        assert all(relation.relation_id != old_relation_id for relation in current.relations)
+
+        historical_frame = build_query_frame("Show me the blocker history for Cosmic Memory")
+        historical_frame.prefer_current_state = False
+        historical = await store.traverse(historical_frame)
+        assert any(relation.relation_id == old_relation_id for relation in historical.relations)
+
+    asyncio.run(run())
+
+
+def test_graph_store_can_invalidate_active_fact_via_internal_fact_adjudicator():
+    async def run():
+        store = InMemoryGraphStore()
+        first = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_old_fact",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Embedding latency",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="project",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Cosmic Memory is blocked by embedding latency.",
+                    )
+                ],
+                source_text="Cosmic Memory is blocked by embedding latency.",
+            )
+        )
+        old_relation_id = first.relation_ids[0]
+        fact_adjudicator = FakeFactAdjudicator(
+            FactAdjudicationDecision(
+                decision="invalidate_existing",
+                invalidated_relation_ids=[old_relation_id],
+                confidence=0.91,
+                rationale="The new blocker replaces the older active blocker.",
+            )
+        )
+        store.fact_adjudicator = fact_adjudicator
+
+        second = await store.ingest_document(
+            GraphDocument(
+                memory_id="mem_new_fact",
+                entities=[
+                    GraphDocumentEntity(
+                        local_ref="project",
+                        entity_type=EntityType.PROJECT,
+                        canonical_name="Cosmic Memory",
+                    ),
+                    GraphDocumentEntity(
+                        local_ref="blocker",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Neo4j provisioning",
+                    ),
+                ],
+                relations=[
+                    GraphDocumentRelation(
+                        source_ref="project",
+                        target_ref="blocker",
+                        relation_type=RelationType.BLOCKED_BY,
+                        fact="Cosmic Memory is blocked by Neo4j provisioning.",
+                    )
+                ],
+                source_text="Cosmic Memory is blocked by Neo4j provisioning instead of the earlier latency issue.",
+            )
+        )
+
+        assert second.invalidated_relation_ids == [old_relation_id]
+        old_relation = store._relations[old_relation_id]
+        assert old_relation.invalidated_by_episode_id == second.episode_id
+
+        active = await store.traverse(build_query_frame("What is blocking Cosmic Memory right now?"))
+        assert active.relations
+        assert all(relation.relation_id != old_relation_id for relation in active.relations)
+        assert any("Neo4j provisioning" in relation.fact for relation in active.relations)
+        assert active.episodes
+        assert any(old_relation_id in episode.invalidated_relation_ids for episode in active.episodes)
+        assert fact_adjudicator.requests
 
     asyncio.run(run())

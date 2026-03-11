@@ -18,6 +18,7 @@ from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
     GenerateEmbeddingsRequest,
+    IngestEpisodeRequest,
     PassiveRecallRequest,
     SupersedeMemoryRequest,
     WriteCoreFactRequest,
@@ -32,6 +33,7 @@ from cosmic_memory.graph import (
     InMemoryGraphStore,
     Neo4jGraphStore,
     XAIEntityAdjudicationService,
+    XAIFactAdjudicationService,
 )
 from cosmic_memory.graph.entity_index import InMemoryEntitySimilarityIndex
 from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
@@ -77,6 +79,11 @@ def create_app(
     async def write_memory(payload: WriteMemoryRequest, request: Request):
         svc: MemoryService = request.app.state.memory_service
         return await svc.write(payload)
+
+    @app.post("/v1/episodes", status_code=status.HTTP_201_CREATED)
+    async def ingest_episode(payload: IngestEpisodeRequest, request: Request):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.ingest_episode(payload)
 
     @app.post("/v1/core-facts", status_code=status.HTTP_201_CREATED)
     async def write_core_fact(payload: WriteCoreFactRequest, request: Request):
@@ -307,12 +314,17 @@ def _build_graph_store_from_env(
     if backend in {"", "none", "off"}:
         return None
     adjudicator = _build_graph_adjudicator_from_env()
+    fact_adjudicator = _build_graph_fact_adjudicator_from_env()
     entity_index = _build_entity_index_from_env(
         embedding_service,
         default_path=default_path,
     )
     if backend == "memory":
-        return InMemoryGraphStore(entity_index=entity_index, adjudicator=adjudicator)
+        return InMemoryGraphStore(
+            entity_index=entity_index,
+            adjudicator=adjudicator,
+            fact_adjudicator=fact_adjudicator,
+        )
     if backend == "neo4j":
         uri = os.environ.get("COSMIC_MEMORY_NEO4J_URI")
         username = os.environ.get("COSMIC_MEMORY_NEO4J_USERNAME")
@@ -331,6 +343,7 @@ def _build_graph_store_from_env(
             database=database,
             entity_index=entity_index,
             adjudicator=adjudicator,
+            fact_adjudicator=fact_adjudicator,
         )
     raise RuntimeError(
         f"Unsupported graph backend: {backend}. "
@@ -437,5 +450,40 @@ def _build_graph_adjudicator_from_env():
         ),
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_MAX_SECONDS", "12.0")
+        ),
+    )
+
+
+def _build_graph_fact_adjudicator_from_env():
+    raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_ENABLED")
+    api_key = os.environ.get("XAI_API_KEY")
+    if raw_enabled is None:
+        enabled = bool(api_key)
+    else:
+        enabled = raw_enabled.strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        return None
+    if not api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required when graph fact adjudication is enabled."
+        )
+    return XAIFactAdjudicationService(
+        api_key=api_key,
+        model_name=os.environ.get(
+            "COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MODEL",
+            "grok-4-1-fast-reasoning",
+        ),
+        timezone_name=os.environ.get("COSMIC_MEMORY_TIMEZONE", "UTC"),
+        max_parallel_requests=int(
+            os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MAX_PARALLEL", "2")
+        ),
+        max_retries=int(
+            os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MAX_RETRIES", "3")
+        ),
+        retry_base_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_BASE_SECONDS", "1.0")
+        ),
+        retry_max_seconds=float(
+            os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_MAX_SECONDS", "12.0")
         ),
     )

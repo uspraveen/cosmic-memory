@@ -61,6 +61,25 @@ class WriteMemoryRequest(BaseModel):
     provenance: MemoryProvenance
 
 
+class EpisodeObservation(BaseModel):
+    role: str
+    content: str
+    name: str | None = None
+    created_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IngestEpisodeRequest(BaseModel):
+    observations: list[EpisodeObservation] = Field(default_factory=list, min_length=1)
+    provenance: MemoryProvenance
+    kind: MemoryKind = MemoryKind.TRANSCRIPT
+    title: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    episode_type: str | None = None
+    extract_graph: bool = True
+
+
 class SupersedeMemoryRequest(BaseModel):
     replacement: WriteMemoryRequest
 
@@ -228,8 +247,28 @@ class GraphRelation(BaseModel):
     relation_type: str
     fact: str
     memory_ids: list[str] = Field(default_factory=list)
+    episode_ids: list[str] = Field(default_factory=list)
     valid_at: datetime | None = None
     invalid_at: datetime | None = None
+    invalidated_by_episode_id: str | None = None
+
+
+class GraphEpisodeItem(BaseModel):
+    episode_id: str
+    memory_id: str
+    source_type: str
+    provenance_source_kind: str | None = None
+    provenance_source_id: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
+    channel: str | None = None
+    created_at: datetime
+    extracted_at: datetime
+    extraction_confidence: float
+    rationale: str | None = None
+    source_excerpt: str | None = None
+    produced_relation_ids: list[str] = Field(default_factory=list)
+    invalidated_relation_ids: list[str] = Field(default_factory=list)
 
 
 class ActiveRecallRequest(BaseModel):
@@ -253,8 +292,15 @@ class ActiveRecallResponse(BaseModel):
     items: list[RecallItem] = Field(default_factory=list)
     entities: list[GraphEntity] = Field(default_factory=list)
     relations: list[GraphRelation] = Field(default_factory=list)
+    episodes: list[GraphEpisodeItem] = Field(default_factory=list)
     search_plan: list[str] = Field(default_factory=list)
     diagnostics: ActiveRecallDiagnostics | None = None
+
+
+class EpisodeIngestResponse(BaseModel):
+    record: MemoryRecord
+    observation_count: int
+    graph_episode_id: str | None = None
 
 
 class HealthStatus(BaseModel):

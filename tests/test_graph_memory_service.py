@@ -81,6 +81,7 @@ def test_active_recall_prefers_graph_traversal_when_available():
         assert result.items[0].memory_id == record.memory_id
         assert result.entities
         assert result.relations
+        assert result.episodes
         assert result.relations[0].relation_type == RelationType.WORKS_ON.value
         assert result.diagnostics is not None
         assert result.diagnostics.flags["graph_used"] is True

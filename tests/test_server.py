@@ -60,6 +60,32 @@ def test_core_fact_endpoint():
     assert "User prefers concise answers." in payload["rendered"]
 
 
+def test_episode_ingest_endpoint():
+    client = TestClient(create_development_app())
+    response = client.post(
+        "/v1/episodes",
+        json={
+            "observations": [
+                {"role": "user", "content": "We should improve graph retrieval."},
+                {"role": "assistant", "content": "I will add retrieval recipes."},
+            ],
+            "provenance": {
+                "source_kind": "gateway",
+                "created_by": "test",
+                "session_id": "sess_20260311",
+            },
+            "extract_graph": False,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["observation_count"] == 2
+    assert payload["record"]["kind"] == "transcript"
+    assert payload["record"]["metadata"]["episode_observation_count"] == 2
+    assert payload["graph_episode_id"] is None
+
+
 def test_agent_surface_endpoints():
     client = TestClient(create_development_app())
 

@@ -37,7 +37,9 @@ from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     CanonicalMemorySnapshot,
     CoreFactBlock,
+    EpisodeIngestResponse,
     HealthStatus,
+    IngestEpisodeRequest,
     IndexStatusResponse,
     IndexSyncResponse,
     MemoryRecord,
@@ -49,10 +51,15 @@ from cosmic_memory.domain.models import (
     WriteMemoryRequest,
     utc_now,
 )
+from cosmic_memory.episode_ingestion import (
+    build_episode_ingest_response,
+    build_episode_write_request,
+)
 from cosmic_memory.extraction.base import GraphExtractionService
 from cosmic_memory.graph import GraphStore, build_query_frame, ensure_graph_document_for_record
 from cosmic_memory.index.base import PassiveMemoryIndex
 from cosmic_memory.retrieval import (
+    apply_graph_recipe_for_mode,
     build_active_response,
     build_active_response_with_graph,
     build_passive_response,
@@ -105,6 +112,13 @@ class FilesystemMemoryService:
         )
         await self._persist(record)
         return record
+
+    async def ingest_episode(self, request: IngestEpisodeRequest) -> EpisodeIngestResponse:
+        record = await self.write(build_episode_write_request(request))
+        return build_episode_ingest_response(
+            record,
+            observation_count=len(request.observations),
+        )
 
     async def write_core_fact(self, request: WriteCoreFactRequest) -> MemoryRecord:
         write_request = request.to_write_request()
@@ -203,6 +217,21 @@ class FilesystemMemoryService:
                 started_at=service_started,
             )
 
+        recipe_started = perf_counter()
+        recipe_application = apply_graph_recipe_for_mode(
+            graph_result=graph_result,
+            query_frame=query_frame,
+            mode="passive",
+            max_results=request.max_results,
+        )
+        graph_result = recipe_application.graph_result
+        if diagnostics is not None:
+            diagnostics.timings_ms["graph_recipe_ms"] = round(
+                (perf_counter() - recipe_started) * 1000.0,
+                3,
+            )
+            diagnostics.notes.append(f"graph recipe: {recipe_application.recipe_name}")
+
         graph_load_started = perf_counter()
         graph_records = self._load_records_by_ids(graph_result.supporting_memory_ids)
         if diagnostics is not None:
@@ -227,6 +256,7 @@ class FilesystemMemoryService:
             kinds=request.kinds,
             max_results=request.max_results,
             token_budget=request.token_budget,
+            graph_memory_boosts=recipe_application.memory_boosts,
             include_breakdown=request.include_diagnostics,
         )
         diagnostics = response.diagnostics or diagnostics
@@ -247,9 +277,10 @@ class FilesystemMemoryService:
         if self.graph_store is not None:
             if diagnostics is not None:
                 diagnostics.flags["graph_used"] = True
+            query_frame = build_query_frame(request.query)
             graph_started = perf_counter()
             graph_result = await self.graph_store.traverse(
-                build_query_frame(request.query),
+                query_frame,
                 seed_entity_ids=request.seed_entities or None,
                 max_hops=request.max_hops,
                 max_entities=request.max_results,
@@ -260,6 +291,20 @@ class FilesystemMemoryService:
                     (perf_counter() - graph_started) * 1000.0,
                     3,
                 )
+            recipe_started = perf_counter()
+            recipe_application = apply_graph_recipe_for_mode(
+                graph_result=graph_result,
+                query_frame=query_frame,
+                mode="active",
+                max_results=request.max_results,
+            )
+            graph_result = recipe_application.graph_result
+            if diagnostics is not None:
+                diagnostics.timings_ms["graph_recipe_ms"] = round(
+                    (perf_counter() - recipe_started) * 1000.0,
+                    3,
+                )
+                diagnostics.notes.append(f"graph recipe: {recipe_application.recipe_name}")
             load_started = perf_counter()
             graph_records = self._load_records_by_ids(graph_result.supporting_memory_ids)
             if diagnostics is not None:
@@ -273,7 +318,8 @@ class FilesystemMemoryService:
                 request.query,
                 request.kinds,
                 limit=request.max_results,
-                score_boosts={memory_id: 0.5 for memory_id in graph_result.supporting_memory_ids},
+                score_boosts=recipe_application.memory_boosts
+                or {memory_id: 0.5 for memory_id in graph_result.supporting_memory_ids},
             )
             if diagnostics is not None:
                 diagnostics.timings_ms["graph_match_ms"] = round(

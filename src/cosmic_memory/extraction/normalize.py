@@ -99,6 +99,7 @@ def normalize_extraction_result(
                 for relation in result.relations
             ],
             source_text=record.content,
+            episode=document_episode(record),
         )
     )
     if document is None:
@@ -194,6 +195,7 @@ def normalize_graph_document(
             relations=output_relations,
             source_text=document.source_text,
             created_at=document.created_at,
+            episode=document.episode,
         ),
         report,
     )
@@ -263,6 +265,13 @@ def _backfill_relation_times(document: GraphDocument, *, anchor_time: datetime) 
 
 def _looks_temporally_anchored(value: str) -> bool:
     return bool(_CURRENT_TIME_CUE_PATTERN.search(value) or _ABSOLUTE_DATE_PATTERN.search(value))
+
+
+def document_episode(record: MemoryRecord):
+    payload = record.metadata.get("graph_document")
+    if isinstance(payload, dict):
+        return payload.get("episode")
+    return None
 
 
 def _find_merge_target(
