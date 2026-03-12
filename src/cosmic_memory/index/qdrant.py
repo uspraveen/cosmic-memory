@@ -67,6 +67,7 @@ class QdrantHybridMemoryIndex:
         self.embed_parallel_requests = embed_parallel_requests
         self.dense_encoding_format = dense_encoding_format
         self._is_local_path = path is not None and url is None
+        self._client_lock = asyncio.Lock()
         self._ready = False
 
         if self.sparse_encoder is None and not _supports_qdrant_native_bm25():
@@ -84,11 +85,22 @@ class QdrantHybridMemoryIndex:
         if self._ready:
             return
 
+        if self._is_local_path:
+            async with self._client_lock:
+                if self._ready:
+                    return
+                await self._ensure_ready_unlocked()
+                self._ready = True
+            return
+
+        await self._ensure_ready_unlocked()
+        self._ready = True
+
+    async def _ensure_ready_unlocked(self) -> None:
         exists = False
         if hasattr(self.client, "collection_exists"):
             exists = await asyncio.to_thread(self.client.collection_exists, self.collection_name)
         if exists:
-            self._ready = True
             return
 
         await asyncio.to_thread(
@@ -106,7 +118,6 @@ class QdrantHybridMemoryIndex:
                 ),
             },
         )
-        self._ready = True
 
     async def sync_record(self, snapshot: CanonicalMemorySnapshot) -> None:
         await self.sync_records([snapshot])
@@ -181,7 +192,7 @@ class QdrantHybridMemoryIndex:
                 )
             )
 
-        await asyncio.to_thread(
+        await self._run_client_call(
             self.client.upsert,
             collection_name=self.collection_name,
             points=points,
@@ -193,7 +204,7 @@ class QdrantHybridMemoryIndex:
         states: dict[str, IndexPointState] = {}
 
         while True:
-            records, next_offset = await asyncio.to_thread(
+            records, next_offset = await self._run_client_call(
                 self.client.scroll,
                 collection_name=self.collection_name,
                 offset=offset,
@@ -230,7 +241,7 @@ class QdrantHybridMemoryIndex:
         ]
         if not point_ids:
             return
-        await asyncio.to_thread(
+        await self._run_client_call(
             self.client.delete,
             collection_name=self.collection_name,
             points_selector=point_ids,
@@ -238,7 +249,7 @@ class QdrantHybridMemoryIndex:
         )
 
     async def reset(self) -> None:
-        await asyncio.to_thread(
+        await self._run_client_call(
             self.client.recreate_collection,
             collection_name=self.collection_name,
             vectors_config={
@@ -308,7 +319,7 @@ class QdrantHybridMemoryIndex:
             )
 
         query_started = perf_counter()
-        results = await asyncio.to_thread(
+        results = await self._run_client_call(
             self.client.query_points,
             collection_name=self.collection_name,
             prefetch=[
@@ -394,7 +405,7 @@ class QdrantHybridMemoryIndex:
         close = getattr(self.client, "close", None)
         if close is None:
             return
-        result = close()
+        result = await self._run_client_call(close)
         if inspect.isawaitable(result):
             await result
 
@@ -432,6 +443,12 @@ class QdrantHybridMemoryIndex:
                 values=sparse_vector.values,
             )
         return self._models.Document(text=query_text, model=self.sparse_model_name)
+
+    async def _run_client_call(self, func, /, *args, **kwargs):
+        if self._is_local_path:
+            async with self._client_lock:
+                return await asyncio.to_thread(func, *args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def _approx_token_count(text: str) -> int:
