@@ -19,6 +19,7 @@ from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
     GenerateEmbeddingsRequest,
+    GraphSyncRequest,
     IngestEpisodeRequest,
     PassiveRecallRequest,
     SupersedeMemoryRequest,
@@ -80,6 +81,13 @@ def create_app(
                     await sync_graph()
                 except Exception:
                     logger.exception("cosmic_memory.graph_sync_on_startup_failed")
+        if _graph_warm_cache_on_startup_enabled():
+            warm_graph_cache = getattr(app.state.memory_service, "warm_graph_cache", None)
+            if warm_graph_cache is not None:
+                try:
+                    await warm_graph_cache()
+                except Exception:
+                    logger.exception("cosmic_memory.graph_cache_warm_on_startup_failed")
         yield
         await _close_if_present(getattr(app.state, "embedding_service", None))
         passive_index = getattr(getattr(app.state, "memory_service", None), "passive_index", None)
@@ -262,18 +270,20 @@ def create_app(
     @app.post("/v1/graph/sync")
     async def sync_graph(
         request: Request,
+        payload: GraphSyncRequest | None = None,
         _: None = Depends(require_internal_token),
     ):
         svc: MemoryService = request.app.state.memory_service
-        return await svc.sync_graph()
+        return await svc.sync_graph(payload or GraphSyncRequest())
 
     @app.post("/v1/graph/rebuild")
     async def rebuild_graph(
         request: Request,
+        payload: GraphSyncRequest | None = None,
         _: None = Depends(require_internal_token),
     ):
         svc: MemoryService = request.app.state.memory_service
-        return await svc.rebuild_graph()
+        return await svc.rebuild_graph(payload or GraphSyncRequest())
 
     @app.post("/v1/memories/{memory_id}/supersede")
     async def supersede_memory(
@@ -432,6 +442,14 @@ def _graph_sync_on_startup_enabled() -> bool:
         return raw.strip().lower() not in {"0", "false", "no", "off"}
     backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
     return backend == "memory"
+
+
+def _graph_warm_cache_on_startup_enabled() -> bool:
+    raw = os.environ.get("COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP")
+    if raw is not None:
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
+    return backend == "neo4j"
 
 
 def _build_graph_store_from_env(

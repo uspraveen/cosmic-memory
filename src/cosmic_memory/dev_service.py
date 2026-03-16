@@ -36,6 +36,7 @@ from cosmic_memory.domain.models import (
     CoreFactBlock,
     EpisodeIngestResponse,
     GraphStatusResponse,
+    GraphSyncRequest,
     GraphStoreStats,
     GraphSyncResponse,
     HealthStatus,
@@ -105,6 +106,13 @@ class InMemoryDevelopmentMemoryService:
             graph_identity_key_count=stats.identity_key_count if stats is not None else 0,
             graph_extractor_model=getattr(self.graph_extractor, "model_name", None),
             graph_llm_extractor_model=getattr(self.graph_llm_extractor, "model_name", None),
+            graph_cache_ready=stats.cache_ready if stats is not None else False,
+            graph_cache_memory_count=stats.cache_memory_count if stats is not None else 0,
+            graph_cache_entity_count=stats.cache_entity_count if stats is not None else 0,
+            graph_cache_relation_count=stats.cache_relation_count if stats is not None else 0,
+            graph_cache_episode_count=stats.cache_episode_count if stats is not None else 0,
+            graph_cache_hydrated_at=stats.cache_hydrated_at if stats is not None else None,
+            graph_cache_build_ms=stats.cache_build_ms if stats is not None else None,
         )
 
     async def write(self, request: WriteMemoryRequest) -> MemoryRecord:
@@ -635,13 +643,20 @@ class InMemoryDevelopmentMemoryService:
             relation_count=stats.relation_count if stats is not None else 0,
             episode_count=stats.episode_count if stats is not None else 0,
             identity_key_count=stats.identity_key_count if stats is not None else 0,
+            cache_ready=stats.cache_ready if stats is not None else False,
+            cache_memory_count=stats.cache_memory_count if stats is not None else 0,
+            cache_entity_count=stats.cache_entity_count if stats is not None else 0,
+            cache_relation_count=stats.cache_relation_count if stats is not None else 0,
+            cache_episode_count=stats.cache_episode_count if stats is not None else 0,
+            cache_hydrated_at=stats.cache_hydrated_at if stats is not None else None,
+            cache_build_ms=stats.cache_build_ms if stats is not None else None,
         )
 
-    async def sync_graph(self) -> GraphSyncResponse:
-        return await self._sync_graph(mode="sync")
+    async def sync_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse:
+        return await self._sync_graph(mode="sync", request=request or GraphSyncRequest())
 
-    async def rebuild_graph(self) -> GraphSyncResponse:
-        return await self._sync_graph(mode="rebuild")
+    async def rebuild_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse:
+        return await self._sync_graph(mode="rebuild", request=request or GraphSyncRequest())
 
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest
@@ -669,7 +684,7 @@ class InMemoryDevelopmentMemoryService:
             return None
         return await self.graph_store.stats()
 
-    async def _sync_graph(self, *, mode: str) -> GraphSyncResponse:
+    async def _sync_graph(self, *, mode: str, request: GraphSyncRequest) -> GraphSyncResponse:
         active_records = [record for record in self._records.values() if record.status == RecordStatus.ACTIVE]
         eligible_count = sum(1 for record in active_records if should_extract_graph_for_record(record))
         persisted_count = sum(
@@ -683,9 +698,13 @@ class InMemoryDevelopmentMemoryService:
                 mode=mode,
                 active_memory_count=len(active_records),
                 eligible_memory_count=eligible_count,
+                target_memory_count=len(active_records),
                 persisted_graph_document_count=persisted_count,
+                persisted_graph_document_writes=0,
                 graph_upserts=0,
                 graph_removals=0,
+                llm_backfill_enabled=request.allow_llm,
+                cache_warmed=False,
                 status=status,
             )
 
@@ -710,9 +729,13 @@ class InMemoryDevelopmentMemoryService:
             mode=mode,
             active_memory_count=len(active_records),
             eligible_memory_count=eligible_count,
+            target_memory_count=len(active_records),
             persisted_graph_document_count=persisted_count,
+            persisted_graph_document_writes=0,
             graph_upserts=graph_upserts,
             graph_removals=graph_removals,
+            llm_backfill_enabled=request.allow_llm,
+            cache_warmed=False,
             status=status,
         )
 

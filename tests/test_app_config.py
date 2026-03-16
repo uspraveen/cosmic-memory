@@ -8,6 +8,7 @@ from cosmic_memory.server.app import (
     _build_graph_adjudicator_from_env,
     _build_graph_extractor_from_env,
     _build_graph_store_from_env,
+    _graph_warm_cache_on_startup_enabled,
     _graph_sync_on_startup_enabled,
     _build_passive_index_from_env,
 )
@@ -180,6 +181,19 @@ def test_graph_sync_on_startup_defaults_off_for_non_memory_backend(monkeypatch: 
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
 
     assert _graph_sync_on_startup_enabled() is False
+
+
+def test_graph_warm_cache_on_startup_defaults_on_for_neo4j(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
+
+    assert _graph_warm_cache_on_startup_enabled() is True
+
+
+def test_graph_warm_cache_on_startup_can_be_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP", "false")
+
+    assert _graph_warm_cache_on_startup_enabled() is False
 
 
 def test_build_graph_adjudicator_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

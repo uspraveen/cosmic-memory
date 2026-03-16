@@ -110,8 +110,13 @@ def test_graph_control_endpoints():
     assert status_payload["enabled"] is True
     assert status_payload["backend"] == "memory"
     assert status_payload["ingested_memory_count"] >= 1
+    assert status_payload["cache_ready"] is True
 
-    sync_response = client.post("/v1/graph/sync", headers={"X-Internal-Token": ""})
+    sync_response = client.post(
+        "/v1/graph/sync",
+        headers={"X-Internal-Token": ""},
+        json={"persist_graph_documents": True},
+    )
     assert sync_response.status_code == 200
     assert sync_response.json()["mode"] == "sync"
 

@@ -240,6 +240,13 @@ class GraphStoreStats(BaseModel):
     relation_count: int = 0
     episode_count: int = 0
     identity_key_count: int = 0
+    cache_ready: bool = False
+    cache_memory_count: int = 0
+    cache_entity_count: int = 0
+    cache_relation_count: int = 0
+    cache_episode_count: int = 0
+    cache_hydrated_at: datetime | None = None
+    cache_build_ms: float | None = None
 
 
 class GraphStatusResponse(BaseModel):
@@ -257,6 +264,22 @@ class GraphStatusResponse(BaseModel):
     relation_count: int = 0
     episode_count: int = 0
     identity_key_count: int = 0
+    cache_ready: bool = False
+    cache_memory_count: int = 0
+    cache_entity_count: int = 0
+    cache_relation_count: int = 0
+    cache_episode_count: int = 0
+    cache_hydrated_at: datetime | None = None
+    cache_build_ms: float | None = None
+
+
+class GraphSyncRequest(BaseModel):
+    allow_llm: bool = False
+    persist_graph_documents: bool = False
+    only_missing_graph_documents: bool = False
+    max_records: int | None = Field(default=None, ge=1)
+    memory_ids: list[str] = Field(default_factory=list)
+    warm_cache: bool | None = None
 
 
 class GraphSyncResponse(BaseModel):
@@ -265,9 +288,13 @@ class GraphSyncResponse(BaseModel):
     mode: Literal["sync", "rebuild"]
     active_memory_count: int = 0
     eligible_memory_count: int = 0
+    target_memory_count: int = 0
     persisted_graph_document_count: int = 0
+    persisted_graph_document_writes: int = 0
     graph_upserts: int = 0
     graph_removals: int = 0
+    llm_backfill_enabled: bool = False
+    cache_warmed: bool = False
     status: GraphStatusResponse
 
 
@@ -353,3 +380,10 @@ class HealthStatus(BaseModel):
     graph_identity_key_count: int = 0
     graph_extractor_model: str | None = None
     graph_llm_extractor_model: str | None = None
+    graph_cache_ready: bool = False
+    graph_cache_memory_count: int = 0
+    graph_cache_entity_count: int = 0
+    graph_cache_relation_count: int = 0
+    graph_cache_episode_count: int = 0
+    graph_cache_hydrated_at: datetime | None = None
+    graph_cache_build_ms: float | None = None

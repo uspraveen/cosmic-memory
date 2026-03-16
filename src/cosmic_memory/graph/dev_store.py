@@ -213,6 +213,12 @@ class InMemoryGraphStore:
             relation_count=len(self._relations),
             episode_count=len(self._episodes),
             identity_key_count=len(self._identity_keys),
+            cache_ready=True,
+            cache_memory_count=len({episode.memory_id for episode in self._episodes.values()}),
+            cache_entity_count=len(self._entities),
+            cache_relation_count=len(self._relations),
+            cache_episode_count=len(self._episodes),
+            cache_build_ms=0.0,
         )
 
     async def passive_search(

@@ -10,6 +10,7 @@ from cosmic_memory.dev_service import InMemoryDevelopmentMemoryService
 from cosmic_memory.domain.enums import MemoryKind
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
+    GraphSyncRequest,
     MemoryProvenance,
     MemoryRecord,
     WriteMemoryRequest,
@@ -238,6 +239,160 @@ def test_sync_graph_can_backfill_deterministic_documents_without_llm():
             assert sync.enabled is True
             assert sync.graph_upserts == 1
             assert sync.status.ingested_memory_count == 1
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
+def test_sync_graph_can_persist_backfilled_graph_documents():
+    async def run():
+        from cosmic_memory.filesystem_service import FilesystemMemoryService
+
+        temp_dir = Path(".manual_graph_sync_persist_case")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            service = FilesystemMemoryService(
+                temp_dir,
+                graph_store=InMemoryGraphStore(),
+                graph_extractor=DeterministicGraphExtractionService(
+                    primary_user_display_name="Praveen"
+                ),
+            )
+            record = MemoryRecord(
+                kind=MemoryKind.CORE_FACT,
+                title="Favorite hero",
+                content="User loves iron man",
+                provenance=provenance(),
+            )
+            write_result = service.record_store.write(record)
+            service.registry.upsert(record, write_result.path, write_result.content_hash)
+
+            sync = await service.sync_graph(
+                GraphSyncRequest(
+                    persist_graph_documents=True,
+                    only_missing_graph_documents=True,
+                )
+            )
+            reloaded = service.record_store.read(write_result.path)
+
+            assert sync.enabled is True
+            assert sync.persisted_graph_document_writes == 1
+            assert sync.status.persisted_graph_document_count == 1
+            assert reloaded.metadata["graph_document"]["entities"][0]["canonical_name"] == "Praveen"
+            assert reloaded.metadata["graph_extraction"]["mode"] == "deterministic"
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
+def test_sync_graph_can_limit_llm_backfill_to_missing_documents():
+    class FakeLLMExtractor:
+        model_name = "fake-llm"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def extract(self, record):
+            self.calls.append(record.memory_id)
+            return GraphExtractionResult(
+                should_extract=True,
+                rationale="capture stable preference relation",
+                entities=[
+                    ExtractedGraphEntity(
+                        local_ref="user",
+                        entity_type=EntityType.PERSON,
+                        canonical_name="Praveen",
+                    ),
+                    ExtractedGraphEntity(
+                        local_ref="topic",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Iron Man",
+                    ),
+                ],
+                relations=[
+                    ExtractedGraphRelation(
+                        source_ref="user",
+                        target_ref="topic",
+                        relation_type=RelationType.PREFERS,
+                        fact=record.content,
+                    )
+                ],
+            )
+
+    async def run():
+        from cosmic_memory.filesystem_service import FilesystemMemoryService
+
+        temp_dir = Path(".manual_graph_sync_llm_limit_case")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            llm_extractor = FakeLLMExtractor()
+            service = FilesystemMemoryService(
+                temp_dir,
+                graph_store=InMemoryGraphStore(),
+                graph_extractor=None,
+                graph_llm_extractor=llm_extractor,
+            )
+            seeded_record = MemoryRecord(
+                kind=MemoryKind.CORE_FACT,
+                title="Already prepared",
+                content="User prefers concise answers",
+                provenance=provenance(),
+                metadata={
+                    "graph_document": {
+                        "memory_id": "ignored",
+                        "entities": [
+                            {
+                                "local_ref": "user",
+                                "entity_type": "person",
+                                "canonical_name": "Praveen",
+                            },
+                            {
+                                "local_ref": "topic",
+                                "entity_type": "topic",
+                                "canonical_name": "concise answers",
+                            },
+                        ],
+                        "relations": [
+                            {
+                                "source_ref": "user",
+                                "target_ref": "topic",
+                                "relation_type": "prefers",
+                                "fact": "User prefers concise answers",
+                            }
+                        ],
+                    }
+                },
+            )
+            missing_record = MemoryRecord(
+                kind=MemoryKind.CORE_FACT,
+                title="Needs backfill",
+                content="User loves iron man",
+                provenance=provenance(),
+            )
+            for record in (seeded_record, missing_record):
+                write_result = service.record_store.write(record)
+                service.registry.upsert(record, write_result.path, write_result.content_hash)
+
+            sync = await service.sync_graph(
+                GraphSyncRequest(
+                    allow_llm=True,
+                    persist_graph_documents=True,
+                    only_missing_graph_documents=True,
+                    max_records=1,
+                )
+            )
+            reloaded = await service.get(missing_record.memory_id)
+
+            assert sync.enabled is True
+            assert sync.target_memory_count == 1
+            assert sync.persisted_graph_document_writes == 1
+            assert llm_extractor.calls == [missing_record.memory_id]
+            assert reloaded is not None
+            assert reloaded.metadata["graph_extraction"]["mode"] == "llm"
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

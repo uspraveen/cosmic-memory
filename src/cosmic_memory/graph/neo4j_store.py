@@ -8,6 +8,7 @@ import hashlib
 import json
 from datetime import datetime
 import logging
+from time import perf_counter
 
 from cosmic_memory.domain.models import GraphStoreStats, utc_now
 from cosmic_memory.graph.dev_store import InMemoryGraphStore
@@ -85,6 +86,8 @@ class Neo4jGraphStore:
         self._ready = False
         self._cache_lock = asyncio.Lock()
         self._search_cache: InMemoryGraphStore | None = None
+        self._cache_hydrated_at: datetime | None = None
+        self._cache_build_ms: float | None = None
 
     async def ingest_document(self, document: GraphDocument) -> GraphIngestResult:
         await self._ensure_ready()
@@ -278,6 +281,8 @@ class Neo4jGraphStore:
             await self.entity_index.delete_entities(entity_ids)
         async with self._cache_lock:
             self._search_cache = None
+            self._cache_hydrated_at = None
+            self._cache_build_ms = None
 
     async def stats(self) -> GraphStoreStats:
         await self._ensure_ready()
@@ -303,7 +308,20 @@ class Neo4jGraphStore:
             relation_count=int(relation_row["count"] if relation_row is not None else 0),
             episode_count=int(episode_row["count"] if episode_row is not None else 0),
             identity_key_count=int(key_row["count"] if key_row is not None else 0),
+            cache_ready=self._search_cache is not None,
+            cache_memory_count=len({episode.memory_id for episode in self._search_cache._episodes.values()})
+            if self._search_cache is not None
+            else 0,
+            cache_entity_count=len(self._search_cache._entities) if self._search_cache is not None else 0,
+            cache_relation_count=len(self._search_cache._relations) if self._search_cache is not None else 0,
+            cache_episode_count=len(self._search_cache._episodes) if self._search_cache is not None else 0,
+            cache_hydrated_at=self._cache_hydrated_at,
+            cache_build_ms=self._cache_build_ms,
         )
+
+    async def warm_cache(self) -> GraphStoreStats:
+        await self._load_search_store()
+        return await self.stats()
 
     async def resolve_identity(
         self, candidate: GraphIdentityCandidate
@@ -1043,6 +1061,7 @@ class Neo4jGraphStore:
             return store
 
     async def _hydrate_search_store(self) -> InMemoryGraphStore:
+        hydration_started = perf_counter()
         store = InMemoryGraphStore(entity_index=self.entity_index)
         async with self.driver.session(database=self.database) as session:
             entity_result = await session.run(
@@ -1121,12 +1140,24 @@ class Neo4jGraphStore:
         store._relations = relations
         store._key_to_entities = defaultdict(set, key_to_entities)
         store._entity_to_relations = defaultdict(set, entity_to_relations)
+        self._cache_hydrated_at = utc_now()
+        self._cache_build_ms = round((perf_counter() - hydration_started) * 1000.0, 3)
+        logger.info(
+            "memory.graph_cache_hydrated backend=neo4j entities=%s relations=%s episodes=%s memory_count=%s build_ms=%s",
+            len(entities),
+            len(relations),
+            len(episodes),
+            len({episode.memory_id for episode in episodes.values()}),
+            self._cache_build_ms,
+        )
         return store
 
     async def _cache_ingest_document(self, document: GraphDocument) -> None:
         async with self._cache_lock:
             if self.adjudicator is not None or self.fact_adjudicator is not None:
                 self._search_cache = None
+                self._cache_hydrated_at = None
+                self._cache_build_ms = None
                 return
             if self._search_cache is None:
                 self._search_cache = await self._hydrate_search_store()
@@ -1137,6 +1168,8 @@ class Neo4jGraphStore:
         async with self._cache_lock:
             if self.adjudicator is not None or self.fact_adjudicator is not None:
                 self._search_cache = None
+                self._cache_hydrated_at = None
+                self._cache_build_ms = None
                 return
             if self._search_cache is None:
                 return

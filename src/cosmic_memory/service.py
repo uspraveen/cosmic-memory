@@ -23,6 +23,7 @@ from cosmic_memory.domain.models import (
     CoreFactBlock,
     EpisodeIngestResponse,
     GraphStatusResponse,
+    GraphSyncRequest,
     GraphSyncResponse,
     HealthStatus,
     IngestEpisodeRequest,
@@ -78,9 +79,9 @@ class MemoryService(Protocol):
 
     async def get_graph_status(self) -> GraphStatusResponse: ...
 
-    async def sync_graph(self) -> GraphSyncResponse: ...
+    async def sync_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse: ...
 
-    async def rebuild_graph(self) -> GraphSyncResponse: ...
+    async def rebuild_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse: ...
 
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest

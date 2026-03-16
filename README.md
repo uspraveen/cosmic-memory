@@ -305,6 +305,7 @@ Relevant environment variables:
 - `COSMIC_MEMORY_SYNC_ON_STARTUP` or `MEMORY_SYNC_ON_STARTUP` (default `true`)
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)
 - `COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP` (default `true` for `memory`, otherwise `false`)
+- `COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP` (default `true` for `neo4j`, otherwise `false`)
 - `COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED` (default `true`)
 - `COSMIC_MEMORY_NEO4J_URI`
 - `COSMIC_MEMORY_NEO4J_USERNAME`
@@ -373,12 +374,18 @@ Graph notes:
   - `memory` for local/dev validation
   - `neo4j` as the first persistent backend boundary
   - `none` when graph traversal is disabled
+- `POST /v1/graph/sync` and `POST /v1/graph/rebuild` accept an optional control body with `allow_llm`, `persist_graph_documents`, `only_missing_graph_documents`, `max_records`, `memory_ids`, and `warm_cache`,
+- LLM backfill is opt-in on graph sync/rebuild so normal startup syncs do not silently turn into long xAI jobs,
+- persistent graph backfill should persist normalized `graph_document` payloads back into canonical Markdown before ingest so future rebuilds can stay deterministic,
+- the Neo4j backend warms a read-only in-memory search cache so passive and active retrieval keep the same fast scorer semantics after persistence is enabled.
 
 Benchmarking:
 
 - `python benchmarks/passive_recall_benchmark.py --mode inprocess`
-- the benchmark reports `p50`, `p80`, `p95`, top-1 hit rate, any-hit rate, and token-budget compliance
-- `--mode http --base-url http://127.0.0.1:8000` exercises the HTTP boundary end to end
+- `python benchmarks/active_recall_benchmark.py --mode inprocess`
+- `python benchmarks/retrieval_modes_benchmark.py --modes none,memory,neo4j`
+- the benchmark reports per-mode passive and active latency stats, graph-usage rates, and timeout rates
+- pass `--json-out retrieval-modes.json` to keep the raw sample set for later comparison
 
 Current server endpoints:
 
@@ -403,6 +410,9 @@ Current server endpoints:
 | `GET` | `/v1/index/status` | Report canonical/registry/index consistency state. | Ops, local dev, maintenance jobs | Control-plane endpoint. |
 | `POST` | `/v1/index/sync` | Repair drift between canonical files, registry, and passive index. | Ops, startup hooks, maintenance jobs | Incremental repair path. |
 | `POST` | `/v1/index/rebuild` | Rebuild the passive index from canonical records. | Ops, maintenance jobs | Full rebuild path. |
+| `GET` | `/v1/graph/status` | Report graph ingest, cache, and backend status. | Ops, Gateway health, maintenance jobs | Control-plane endpoint. |
+| `POST` | `/v1/graph/sync` | Incrementally repair persistent graph state from canonical records. | Ops, maintenance jobs | Supports optional LLM backfill and cache warming. |
+| `POST` | `/v1/graph/rebuild` | Rebuild the graph projection from canonical records. | Ops, maintenance jobs | Full graph rebuild path. |
 
 Index behavior is aligned with the current Cosmic architecture:
 
