@@ -28,8 +28,10 @@ from cosmic_memory.graph import (
     GraphIdentityCandidate,
     IdentityKeyType,
     InMemoryGraphStore,
+    Neo4jGraphStore,
     RelationType,
 )
+from cosmic_memory.graph.models import GraphDocument, GraphEpisode
 
 
 def provenance() -> MemoryProvenance:
@@ -475,6 +477,71 @@ def test_sync_graph_continues_after_record_failure_and_reports_failed_ids():
             assert sync.status.ingested_memory_count == 1
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
+def test_neo4j_pending_relation_uses_resolved_entity_names_without_requery():
+    async def run():
+        store = object.__new__(Neo4jGraphStore)
+        persisted_relations = []
+        linked_relation_ids = []
+
+        async def _get_relation(_session, _relation_id):
+            return None
+
+        async def _find_facts(_query):
+            return []
+
+        async def _maybe_invalidate_relations(**_kwargs):
+            return "create", None, []
+
+        async def _persist_relation(_session, relation):
+            persisted_relations.append(relation)
+
+        async def _link_episode_to_relation(_session, *, relation_id, **_kwargs):
+            linked_relation_ids.append(relation_id)
+
+        async def _unexpected_get_entity(_entity_id):
+            raise AssertionError("new relation upsert should not re-query pending entities")
+
+        store._get_relation = _get_relation
+        store.find_facts = _find_facts
+        store._maybe_invalidate_relations = _maybe_invalidate_relations
+        store._persist_relation = _persist_relation
+        store._link_episode_to_relation = _link_episode_to_relation
+        store.get_entity = _unexpected_get_entity
+
+        document = GraphDocument(memory_id="mem_graph_relation")
+        episode = GraphEpisode(
+            episode_id="ep_graph_relation",
+            memory_id=document.memory_id,
+            source_type="memory_record",
+        )
+
+        edge, invalidated = await Neo4jGraphStore._upsert_relation(
+            store,
+            object(),
+            document=document,
+            episode=episode,
+            memory_id=document.memory_id,
+            source_entity_id="entity_praveen",
+            target_entity_id="entity_iron_man",
+            source_entity_name="Praveen",
+            target_entity_name="Iron Man",
+            relation_type=RelationType.PREFERS,
+            fact="User loves iron man",
+            confidence=1.0,
+            valid_at=None,
+            invalid_at=None,
+            expires_at=None,
+        )
+
+        assert edge is not None
+        assert edge.relation_type == RelationType.PREFERS
+        assert invalidated == []
+        assert persisted_relations
+        assert linked_relation_ids == [edge.relation_id]
 
     asyncio.run(run())
 

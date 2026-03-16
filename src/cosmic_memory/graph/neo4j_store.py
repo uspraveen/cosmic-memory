@@ -93,6 +93,7 @@ class Neo4jGraphStore:
         await self._ensure_ready()
         async with self.driver.session(database=self.database) as session:
             ref_to_entity_id: dict[str, str] = {}
+            ref_to_entity_name: dict[str, str] = {}
             resolution_events: list[IdentityResolutionResult] = []
             changed_entities: dict[str, GraphEntityNode] = {}
             episode = _coerce_episode(document)
@@ -105,6 +106,11 @@ class Neo4jGraphStore:
                     document_entity=entity,
                 )
                 ref_to_entity_id[entity.local_ref] = resolved_entity.entity_id
+                ref_to_entity_name[entity.local_ref] = (
+                    resolved_entity.canonical_name
+                    or entity.canonical_name
+                    or resolved_entity.entity_id
+                )
                 changed_entities[resolved_entity.entity_id] = resolved_entity
                 resolution_events.extend(events)
 
@@ -122,6 +128,14 @@ class Neo4jGraphStore:
                     memory_id=document.memory_id,
                     source_entity_id=source_entity_id,
                     target_entity_id=target_entity_id,
+                    source_entity_name=ref_to_entity_name.get(
+                        relation.source_ref,
+                        source_entity_id,
+                    ),
+                    target_entity_name=ref_to_entity_name.get(
+                        relation.target_ref,
+                        target_entity_id,
+                    ),
                     relation_type=relation.relation_type,
                     fact=relation.fact,
                     confidence=relation.confidence,
@@ -627,6 +641,8 @@ class Neo4jGraphStore:
         memory_id: str,
         source_entity_id: str,
         target_entity_id: str,
+        source_entity_name: str | None,
+        target_entity_name: str | None,
         relation_type: RelationType,
         fact: str,
         confidence: float,
@@ -648,9 +664,9 @@ class Neo4jGraphStore:
             pending = PendingFactContext(
                 relation_type=relation_type,
                 source_entity_id=source_entity_id,
-                source_entity_name=(await self.get_entity(source_entity_id)).canonical_name,
+                source_entity_name=source_entity_name or source_entity_id,
                 target_entity_id=target_entity_id,
-                target_entity_name=(await self.get_entity(target_entity_id)).canonical_name,
+                target_entity_name=target_entity_name or target_entity_id,
                 fact=fact,
                 confidence=confidence,
                 valid_at=valid_at,
