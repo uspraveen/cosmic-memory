@@ -8,7 +8,7 @@ import re
 from collections import defaultdict, deque
 from datetime import timezone
 
-from cosmic_memory.domain.models import utc_now
+from cosmic_memory.domain.models import GraphStoreStats, utc_now
 from cosmic_memory.graph.adjudication import (
     EntityAdjudicationRequest,
     EntityAdjudicationService,
@@ -193,6 +193,27 @@ class InMemoryGraphStore:
             await self.entity_index.sync_entities(
                 [self._entities[entity_id] for entity_id in touched_entity_ids if entity_id in self._entities and self._entities[entity_id].memory_ids]
             )
+
+    async def reset(self) -> None:
+        entity_ids = list(self._entities.keys())
+        self._entities.clear()
+        self._episodes.clear()
+        self._identity_keys.clear()
+        self._entity_to_relations.clear()
+        self._relations.clear()
+        self._key_to_entities.clear()
+        if self.entity_index is not None and entity_ids:
+            await self.entity_index.delete_entities(entity_ids)
+
+    async def stats(self) -> GraphStoreStats:
+        return GraphStoreStats(
+            backend="memory",
+            memory_count=len({episode.memory_id for episode in self._episodes.values()}),
+            entity_count=len(self._entities),
+            relation_count=len(self._relations),
+            episode_count=len(self._episodes),
+            identity_key_count=len(self._identity_keys),
+        )
 
     async def passive_search(
         self,

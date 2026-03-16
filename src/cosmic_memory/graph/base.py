@@ -16,12 +16,17 @@ from cosmic_memory.graph.models import (
     GraphSearchResult,
     IdentityResolutionResult,
 )
+from cosmic_memory.domain.models import GraphStoreStats
 
 
 class GraphStore(Protocol):
     async def ingest_document(self, document: GraphDocument) -> GraphIngestResult: ...
 
     async def remove_memory(self, memory_id: str) -> None: ...
+
+    async def reset(self) -> None: ...
+
+    async def stats(self) -> GraphStoreStats: ...
 
     async def resolve_identity(
         self, candidate: GraphIdentityCandidate

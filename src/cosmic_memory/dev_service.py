@@ -35,6 +35,9 @@ from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     CoreFactBlock,
     EpisodeIngestResponse,
+    GraphStatusResponse,
+    GraphStoreStats,
+    GraphSyncResponse,
     HealthStatus,
     IngestEpisodeRequest,
     IndexStatusResponse,
@@ -53,7 +56,12 @@ from cosmic_memory.episode_ingestion import (
     build_episode_write_request,
 )
 from cosmic_memory.extraction.base import GraphExtractionService
-from cosmic_memory.graph import GraphStore, build_query_frame, ensure_graph_document_for_record
+from cosmic_memory.graph import (
+    GraphStore,
+    build_query_frame,
+    ensure_graph_document_for_record,
+    should_extract_graph_for_record,
+)
 from cosmic_memory.retrieval import (
     apply_graph_recipe_for_mode,
     build_active_response,
@@ -75,15 +83,29 @@ class InMemoryDevelopmentMemoryService:
         *,
         graph_store: GraphStore | None = None,
         graph_extractor: GraphExtractionService | None = None,
+        graph_llm_extractor: GraphExtractionService | None = None,
         passive_graph_timeout_seconds: float = 0.12,
     ) -> None:
         self._records: dict[str, MemoryRecord] = {}
         self.graph_store = graph_store
         self.graph_extractor = graph_extractor
+        self.graph_llm_extractor = graph_llm_extractor
         self.passive_graph_timeout_seconds = passive_graph_timeout_seconds
 
     async def health(self) -> HealthStatus:
-        return HealthStatus(ok=True, mode="in_memory_dev")
+        stats = await self._graph_store_stats()
+        return HealthStatus(
+            ok=True,
+            mode="in_memory_dev",
+            graph_enabled=self.graph_store is not None,
+            graph_backend=stats.backend if stats is not None else None,
+            graph_entity_count=stats.entity_count if stats is not None else 0,
+            graph_relation_count=stats.relation_count if stats is not None else 0,
+            graph_episode_count=stats.episode_count if stats is not None else 0,
+            graph_identity_key_count=stats.identity_key_count if stats is not None else 0,
+            graph_extractor_model=getattr(self.graph_extractor, "model_name", None),
+            graph_llm_extractor_model=getattr(self.graph_llm_extractor, "model_name", None),
+        )
 
     async def write(self, request: WriteMemoryRequest) -> MemoryRecord:
         record = MemoryRecord(
@@ -591,6 +613,36 @@ class InMemoryDevelopmentMemoryService:
             status=status,
         )
 
+    async def get_graph_status(self) -> GraphStatusResponse:
+        active_records = [record for record in self._records.values() if record.status == RecordStatus.ACTIVE]
+        stats = await self._graph_store_stats()
+        return GraphStatusResponse(
+            enabled=self.graph_store is not None,
+            backend=stats.backend if stats is not None else None,
+            extractor_enabled=self.graph_extractor is not None,
+            extractor_model=getattr(self.graph_extractor, "model_name", None),
+            llm_extractor_enabled=self.graph_llm_extractor is not None,
+            llm_extractor_model=getattr(self.graph_llm_extractor, "model_name", None),
+            active_memory_count=len(active_records),
+            eligible_memory_count=sum(
+                1 for record in active_records if should_extract_graph_for_record(record)
+            ),
+            persisted_graph_document_count=sum(
+                1 for record in active_records if record.metadata.get("graph_document") is not None
+            ),
+            ingested_memory_count=stats.memory_count if stats is not None else 0,
+            entity_count=stats.entity_count if stats is not None else 0,
+            relation_count=stats.relation_count if stats is not None else 0,
+            episode_count=stats.episode_count if stats is not None else 0,
+            identity_key_count=stats.identity_key_count if stats is not None else 0,
+        )
+
+    async def sync_graph(self) -> GraphSyncResponse:
+        return await self._sync_graph(mode="sync")
+
+    async def rebuild_graph(self) -> GraphSyncResponse:
+        return await self._sync_graph(mode="rebuild")
+
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest
     ) -> MemoryRecord | None:
@@ -612,25 +664,91 @@ class InMemoryDevelopmentMemoryService:
         self._records[replacement.memory_id] = replacement
         return replacement
 
-    async def _sync_graph_record(self, record: MemoryRecord) -> None:
+    async def _graph_store_stats(self) -> GraphStoreStats | None:
         if self.graph_store is None:
-            return
+            return None
+        return await self.graph_store.stats()
+
+    async def _sync_graph(self, *, mode: str) -> GraphSyncResponse:
+        active_records = [record for record in self._records.values() if record.status == RecordStatus.ACTIVE]
+        eligible_count = sum(1 for record in active_records if should_extract_graph_for_record(record))
+        persisted_count = sum(
+            1 for record in active_records if record.metadata.get("graph_document") is not None
+        )
+        if self.graph_store is None:
+            status = await self.get_graph_status()
+            return GraphSyncResponse(
+                enabled=False,
+                backend=None,
+                mode=mode,
+                active_memory_count=len(active_records),
+                eligible_memory_count=eligible_count,
+                persisted_graph_document_count=persisted_count,
+                graph_upserts=0,
+                graph_removals=0,
+                status=status,
+            )
+
+        if mode == "rebuild":
+            await self.graph_store.reset()
+
+        graph_upserts = 0
+        graph_removals = 0
+        for record in list(self._records.values()):
+            if record.status != RecordStatus.ACTIVE:
+                await self.graph_store.remove_memory(record.memory_id)
+                graph_removals += 1
+                continue
+            result = await self._sync_graph_record(record, allow_llm=False)
+            if result is not None:
+                graph_upserts += 1
+
+        status = await self.get_graph_status()
+        return GraphSyncResponse(
+            enabled=True,
+            backend=status.backend,
+            mode=mode,
+            active_memory_count=len(active_records),
+            eligible_memory_count=eligible_count,
+            persisted_graph_document_count=persisted_count,
+            graph_upserts=graph_upserts,
+            graph_removals=graph_removals,
+            status=status,
+        )
+
+    async def _sync_graph_record(
+        self,
+        record: MemoryRecord,
+        *,
+        allow_llm: bool = False,
+    ):
+        if self.graph_store is None:
+            return None
         await self.graph_store.remove_memory(record.memory_id)
         if record.status != RecordStatus.ACTIVE:
-            return
+            return None
         document = await ensure_graph_document_for_record(
             record,
             extractor=self.graph_extractor,
+            llm_extractor=self.graph_llm_extractor,
+            allow_llm=allow_llm,
         )
         if document is None:
-            return
-        await self.graph_store.ingest_document(document)
+            return None
+        return await self.graph_store.ingest_document(document)
 
-    async def _prepare_record(self, record: MemoryRecord) -> None:
+    async def _prepare_record(
+        self,
+        record: MemoryRecord,
+        *,
+        allow_llm: bool = True,
+    ) -> None:
         try:
             await ensure_graph_document_for_record(
                 record,
                 extractor=self.graph_extractor,
+                llm_extractor=self.graph_llm_extractor,
+                allow_llm=allow_llm,
             )
         except Exception:
             logger.exception("Graph extraction failed for memory %s", record.memory_id)

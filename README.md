@@ -232,8 +232,10 @@ Production behavior:
 `PERPLEXITY_API_KEY` and use Perplexity standard embeddings with
 `pplx-embed-v1-4b`.
 
-If `XAI_API_KEY` is present, production app factories also enable write-time
-graph extraction with `grok-4-1-fast-reasoning` by default.
+Production app factories enable deterministic write-time graph extraction for
+obvious memory writes by default. If `XAI_API_KEY` is present, they also enable
+xAI-backed write-time graph extraction with `grok-4-1-fast-reasoning` as a
+fallback on live writes.
 
 Production app factories also load a local `.env` file if present. A placeholder
 is included in [.env.example](C:/Users/Praveen Raj U S/Downloads/cosmic-memory/.env.example).
@@ -255,10 +257,13 @@ What is live today in the Gateway integration:
 - the Gateway exposes internal proxy routes for future `MemoryRead` / `MemoryWrite` style tooling:
   - `POST /internal/memory/search`
   - `POST /internal/memory/active-search`
-  - `POST /internal/memory/write`
-  - `POST /internal/memory/core-facts`
-  - `GET /internal/memory/core-facts`
-  - `POST /internal/memory/episodes`
+- `POST /internal/memory/write`
+- `POST /internal/memory/core-facts`
+- `GET /internal/memory/core-facts`
+- `POST /internal/memory/episodes`
+- `GET /internal/memory/graph-status`
+- `POST /internal/memory/graph-sync`
+- `POST /internal/memory/graph-rebuild`
 
 Important current limitation:
 
@@ -299,6 +304,8 @@ Relevant environment variables:
 - `COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS` (default `120`)
 - `COSMIC_MEMORY_SYNC_ON_STARTUP` or `MEMORY_SYNC_ON_STARTUP` (default `true`)
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)
+- `COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP` (default `true` for `memory`, otherwise `false`)
+- `COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED` (default `true`)
 - `COSMIC_MEMORY_NEO4J_URI`
 - `COSMIC_MEMORY_NEO4J_USERNAME`
 - `COSMIC_MEMORY_NEO4J_PASSWORD`
@@ -321,6 +328,7 @@ Relevant environment variables:
 - `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_MAX_RETRIES` (default `3`)
 - `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_BASE_SECONDS` (default `1.0`)
 - `COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME` (optional stable display name for the primary user entity)
 - `COSMIC_MEMORY_TIMEZONE` (default `UTC`)
 - `COSMIC_MEMORY_ENV_FILE` (default `.env`)
 

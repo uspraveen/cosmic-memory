@@ -21,7 +21,7 @@ Rules:
 - Deduplicate internally. If two names clearly refer to the same thing in this memory, emit one entity.
 - Use canonical display names and put alternate spellings or titles in alias_values.
 - For people, emit identity candidates when the text contains grounded emails, usernames, phone numbers, or external handles.
-- For first-person statements that clearly describe Cosmic's primary user, create a person entity named "Primary User" and include one identity candidate:
+- For first-person statements that clearly describe Cosmic's primary user, create a person entity using the provided primary-user display name when available, otherwise use "Primary User". Include one identity candidate:
   - key_type: external_account
   - provider: cosmic
   - raw_value: primary_user
@@ -46,6 +46,7 @@ class XAIGraphExtractionService:
         api_key: str | None = None,
         model_name: str = "grok-4-1-fast-reasoning",
         timezone_name: str = "UTC",
+        primary_user_display_name: str | None = None,
         max_parallel_requests: int = 2,
         max_retries: int = 3,
         retry_base_seconds: float = 1.0,
@@ -54,6 +55,7 @@ class XAIGraphExtractionService:
     ) -> None:
         self.model_name = model_name
         self.timezone_name = timezone_name
+        self.primary_user_display_name = (primary_user_display_name or "").strip() or None
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
@@ -95,7 +97,15 @@ class XAIGraphExtractionService:
             temperature=0,
         )
         chat.append(system(_SYSTEM_PROMPT))
-        chat.append(user(_build_user_prompt(record, timezone_name=self.timezone_name)))
+        chat.append(
+            user(
+                _build_user_prompt(
+                    record,
+                    timezone_name=self.timezone_name,
+                    primary_user_display_name=self.primary_user_display_name,
+                )
+            )
+        )
 
         parsed = None
         if hasattr(chat, "parse"):
@@ -121,12 +131,18 @@ class XAIGraphExtractionService:
         return Client(api_key=resolved_api_key)
 
 
-def _build_user_prompt(record: MemoryRecord, *, timezone_name: str) -> str:
+def _build_user_prompt(
+    record: MemoryRecord,
+    *,
+    timezone_name: str,
+    primary_user_display_name: str | None = None,
+) -> str:
     local_now = _local_now(timezone_name)
     utc_now = datetime.now(timezone.utc)
     tags = ", ".join(record.tags) if record.tags else "(none)"
     title = record.title or "(none)"
     provenance = record.provenance.model_dump(mode="json")
+    primary_user_name = (primary_user_display_name or "").strip() or "Primary User"
     ontology = {
         "entity_types": [
             "person",
@@ -171,6 +187,7 @@ Memory metadata:
 - title: {title}
 - tags: {tags}
 - provenance: {provenance}
+- primary_user_display_name: {primary_user_name}
 
 Ontology:
 {ontology}

@@ -3,10 +3,12 @@ import pytest
 from cosmic_memory.embeddings.hash import HashEmbeddingService
 from cosmic_memory.server.app import (
     _build_embedding_service_from_env,
+    _build_deterministic_graph_extractor_from_env,
     _build_entity_index_from_env,
     _build_graph_adjudicator_from_env,
     _build_graph_extractor_from_env,
     _build_graph_store_from_env,
+    _graph_sync_on_startup_enabled,
     _build_passive_index_from_env,
 )
 
@@ -137,6 +139,7 @@ def test_build_graph_extractor_can_construct_xai_backend(monkeypatch: pytest.Mon
     monkeypatch.setenv("XAI_API_KEY", "secret")
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_EXTRACT_MODEL", "grok-4-1-fast-reasoning")
     monkeypatch.setenv("COSMIC_MEMORY_TIMEZONE", "America/Chicago")
+    monkeypatch.setenv("COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME", "Praveen")
     monkeypatch.setattr("cosmic_memory.server.app.XAIGraphExtractionService", FakeExtractor)
 
     _build_graph_extractor_from_env()
@@ -144,6 +147,39 @@ def test_build_graph_extractor_can_construct_xai_backend(monkeypatch: pytest.Mon
     assert captured["api_key"] == "secret"
     assert captured["model_name"] == "grok-4-1-fast-reasoning"
     assert captured["timezone_name"] == "America/Chicago"
+    assert captured["primary_user_display_name"] == "Praveen"
+
+
+def test_build_deterministic_graph_extractor_enabled_by_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME", "Praveen")
+
+    extractor = _build_deterministic_graph_extractor_from_env()
+
+    assert extractor is not None
+    assert extractor.primary_user_display_name == "Praveen"
+
+
+def test_build_deterministic_graph_extractor_can_be_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED", "false")
+
+    extractor = _build_deterministic_graph_extractor_from_env()
+
+    assert extractor is None
+
+
+def test_graph_sync_on_startup_defaults_to_memory_backend(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "memory")
+
+    assert _graph_sync_on_startup_enabled() is True
+
+
+def test_graph_sync_on_startup_defaults_off_for_non_memory_backend(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
+
+    assert _graph_sync_on_startup_enabled() is False
 
 
 def test_build_graph_adjudicator_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

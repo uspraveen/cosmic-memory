@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,7 +28,7 @@ from cosmic_memory.domain.models import (
 from cosmic_memory.embeddings import HashEmbeddingService, PerplexityStandardEmbeddingService
 from cosmic_memory.embeddings.base import EmbeddingService
 from cosmic_memory.env import load_env_file
-from cosmic_memory.extraction import XAIGraphExtractionService
+from cosmic_memory.extraction import DeterministicGraphExtractionService, XAIGraphExtractionService
 from cosmic_memory.filesystem_service import FilesystemMemoryService
 from cosmic_memory.graph import (
     InMemoryGraphStore,
@@ -39,6 +40,8 @@ from cosmic_memory.graph.entity_index import InMemoryEntitySimilarityIndex
 from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
 from cosmic_memory.service import MemoryService
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -70,6 +73,13 @@ def create_app(
             sync_index = getattr(app.state.memory_service, "sync_index", None)
             if sync_index is not None:
                 await sync_index()
+        if _graph_sync_on_startup_enabled():
+            sync_graph = getattr(app.state.memory_service, "sync_graph", None)
+            if sync_graph is not None:
+                try:
+                    await sync_graph()
+                except Exception:
+                    logger.exception("cosmic_memory.graph_sync_on_startup_failed")
         yield
         await _close_if_present(getattr(app.state, "embedding_service", None))
         passive_index = getattr(getattr(app.state, "memory_service", None), "passive_index", None)
@@ -241,6 +251,30 @@ def create_app(
         svc: MemoryService = request.app.state.memory_service
         return await svc.rebuild_index()
 
+    @app.get("/v1/graph/status")
+    async def get_graph_status(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_graph_status()
+
+    @app.post("/v1/graph/sync")
+    async def sync_graph(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.sync_graph()
+
+    @app.post("/v1/graph/rebuild")
+    async def rebuild_graph(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.rebuild_graph()
+
     @app.post("/v1/memories/{memory_id}/supersede")
     async def supersede_memory(
         memory_id: str,
@@ -267,7 +301,8 @@ def create_development_app() -> FastAPI:
         InMemoryDevelopmentMemoryService(
             graph_store=InMemoryGraphStore(
                 entity_index=InMemoryEntitySimilarityIndex(embedding_service=embedding_service)
-            )
+            ),
+            graph_extractor=DeterministicGraphExtractionService(),
         ),
         embedding_service=embedding_service,
     )
@@ -285,13 +320,15 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
         embedding_service,
         default_path=str(Path(data_root) / "qdrant_data"),
     )
-    graph_extractor = _build_graph_extractor_from_env()
+    graph_extractor = _build_deterministic_graph_extractor_from_env()
+    graph_llm_extractor = _build_graph_extractor_from_env()
     return create_app(
         FilesystemMemoryService(
             data_root,
             passive_index=passive_index,
             graph_store=graph_store,
             graph_extractor=graph_extractor,
+            graph_llm_extractor=graph_llm_extractor,
             passive_graph_timeout_seconds=float(
                 os.environ.get("COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS", "120")
             )
@@ -387,6 +424,14 @@ def _sync_on_startup_enabled() -> bool:
         "true",
     )
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _graph_sync_on_startup_enabled() -> bool:
+    raw = os.environ.get("COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP")
+    if raw is not None:
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
+    return backend == "memory"
 
 
 def _build_graph_store_from_env(
@@ -490,6 +535,7 @@ def _build_graph_extractor_from_env():
             "grok-4-1-fast-reasoning",
         ),
         timezone_name=os.environ.get("COSMIC_MEMORY_TIMEZONE", "UTC"),
+        primary_user_display_name=os.environ.get("COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME"),
         max_parallel_requests=int(
             os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_MAX_PARALLEL", "2")
         ),
@@ -500,6 +546,15 @@ def _build_graph_extractor_from_env():
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS", "12.0")
         ),
+    )
+
+
+def _build_deterministic_graph_extractor_from_env():
+    raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED", "true")
+    if raw_enabled.strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    return DeterministicGraphExtractionService(
+        primary_user_display_name=os.environ.get("COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME")
     )
 
 

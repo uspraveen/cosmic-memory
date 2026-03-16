@@ -84,6 +84,42 @@ def test_core_fact_endpoint():
     assert "User prefers concise answers." in payload["rendered"]
 
 
+def test_graph_control_endpoints():
+    client = TestClient(create_development_app())
+    client.post(
+        "/v1/core-facts",
+        headers={"X-Internal-Token": ""},
+        json={
+            "title": "Preference",
+            "fact": "User loves iron man",
+            "canonical_key": "preferences.favorite_hero",
+            "priority": 300,
+            "always_include": True,
+            "tags": ["preference"],
+            "metadata": {},
+            "provenance": {
+                "source_kind": "gateway",
+                "created_by": "test",
+            },
+        },
+    )
+
+    status_response = client.get("/v1/graph/status", headers={"X-Internal-Token": ""})
+    assert status_response.status_code == 200
+    status_payload = status_response.json()
+    assert status_payload["enabled"] is True
+    assert status_payload["backend"] == "memory"
+    assert status_payload["ingested_memory_count"] >= 1
+
+    sync_response = client.post("/v1/graph/sync", headers={"X-Internal-Token": ""})
+    assert sync_response.status_code == 200
+    assert sync_response.json()["mode"] == "sync"
+
+    rebuild_response = client.post("/v1/graph/rebuild", headers={"X-Internal-Token": ""})
+    assert rebuild_response.status_code == 200
+    assert rebuild_response.json()["mode"] == "rebuild"
+
+
 def test_episode_ingest_endpoint():
     client = TestClient(create_development_app())
     response = client.post(

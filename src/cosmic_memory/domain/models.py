@@ -233,6 +233,44 @@ class IndexSyncResponse(BaseModel):
     status: IndexStatusResponse
 
 
+class GraphStoreStats(BaseModel):
+    backend: str
+    memory_count: int = 0
+    entity_count: int = 0
+    relation_count: int = 0
+    episode_count: int = 0
+    identity_key_count: int = 0
+
+
+class GraphStatusResponse(BaseModel):
+    enabled: bool
+    backend: str | None = None
+    extractor_enabled: bool = False
+    extractor_model: str | None = None
+    llm_extractor_enabled: bool = False
+    llm_extractor_model: str | None = None
+    active_memory_count: int = 0
+    eligible_memory_count: int = 0
+    persisted_graph_document_count: int = 0
+    ingested_memory_count: int = 0
+    entity_count: int = 0
+    relation_count: int = 0
+    episode_count: int = 0
+    identity_key_count: int = 0
+
+
+class GraphSyncResponse(BaseModel):
+    enabled: bool
+    backend: str | None = None
+    mode: Literal["sync", "rebuild"]
+    active_memory_count: int = 0
+    eligible_memory_count: int = 0
+    persisted_graph_document_count: int = 0
+    graph_upserts: int = 0
+    graph_removals: int = 0
+    status: GraphStatusResponse
+
+
 class GraphEntity(BaseModel):
     entity_id: str
     name: str
@@ -307,3 +345,11 @@ class HealthStatus(BaseModel):
     ok: bool
     service: str = "cosmic-memory"
     mode: str
+    graph_enabled: bool = False
+    graph_backend: str | None = None
+    graph_entity_count: int = 0
+    graph_relation_count: int = 0
+    graph_episode_count: int = 0
+    graph_identity_key_count: int = 0
+    graph_extractor_model: str | None = None
+    graph_llm_extractor_model: str | None = None

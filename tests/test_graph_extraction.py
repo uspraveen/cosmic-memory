@@ -1,6 +1,8 @@
 import asyncio
+import shutil
 import sys
 import types
+from pathlib import Path
 
 from datetime import UTC, datetime
 
@@ -17,6 +19,7 @@ from cosmic_memory.extraction.models import (
     ExtractedGraphRelation,
     GraphExtractionResult,
 )
+from cosmic_memory.extraction.deterministic import DeterministicGraphExtractionService
 from cosmic_memory.extraction.normalize import normalize_extraction_result
 from cosmic_memory.extraction.xai import XAIGraphExtractionService
 from cosmic_memory.graph import (
@@ -168,6 +171,79 @@ def test_write_can_auto_extract_graph_document_and_ingest_it():
     asyncio.run(run())
 
 
+def test_deterministic_extractor_can_capture_primary_user_preference():
+    async def run():
+        service = InMemoryDevelopmentMemoryService(
+            graph_store=InMemoryGraphStore(),
+            graph_extractor=DeterministicGraphExtractionService(
+                primary_user_display_name="Praveen"
+            ),
+        )
+        record = await service.write(
+            WriteMemoryRequest(
+                kind=MemoryKind.CORE_FACT,
+                title="Favorite hero",
+                content="User loves iron man",
+                provenance=provenance(),
+            )
+        )
+        document = record.metadata["graph_document"]
+        assert document["entities"][0]["canonical_name"] == "Praveen"
+        assert document["relations"][0]["relation_type"] == "prefers"
+
+        response = await service.active_recall(
+            ActiveRecallRequest(query="What does Praveen prefer?")
+        )
+
+        assert response.relations
+        assert response.relations[0].relation_type == "prefers"
+
+    asyncio.run(run())
+
+
+def test_sync_graph_can_backfill_deterministic_documents_without_llm():
+    async def run():
+        seed_service = InMemoryDevelopmentMemoryService()
+        record = await seed_service.write(
+            WriteMemoryRequest(
+                kind=MemoryKind.CORE_FACT,
+                title="Favorite hero",
+                content="User loves iron man",
+                provenance=provenance(),
+            )
+        )
+
+        from cosmic_memory.filesystem_service import FilesystemMemoryService
+
+        temp_dir = Path(".manual_graph_sync_backfill_case")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            filesystem_service = FilesystemMemoryService(
+                temp_dir,
+                graph_store=InMemoryGraphStore(),
+                graph_extractor=DeterministicGraphExtractionService(
+                    primary_user_display_name="Praveen"
+                ),
+            )
+            write_result = filesystem_service.record_store.write(record)
+            filesystem_service.registry.upsert(
+                record,
+                write_result.path,
+                write_result.content_hash,
+            )
+
+            sync = await filesystem_service.sync_graph()
+
+            assert sync.enabled is True
+            assert sync.graph_upserts == 1
+            assert sync.status.ingested_memory_count == 1
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
 def test_normalize_extraction_result_backfills_current_relation_valid_at():
     anchor = datetime(2026, 3, 10, 9, 30, tzinfo=UTC)
     record = MemoryRecord(
@@ -258,6 +334,7 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
         extractor = XAIGraphExtractionService(
             client=FakeClient(),
             timezone_name="America/Chicago",
+            primary_user_display_name="Praveen",
         )
         result = await extractor.extract(
             MemoryRecord(
@@ -278,6 +355,7 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
         assert "Current local time (America/Chicago):" in user_message
         assert "Memory created_at:" in user_message
         assert "Provenance created_at:" in user_message
+        assert "primary_user_display_name: Praveen" in user_message
         assert "Today Cosmic Memory is blocked by embedding latency." in user_message
 
     asyncio.run(run())

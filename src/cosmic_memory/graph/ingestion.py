@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from cosmic_memory.domain.enums import MemoryKind
@@ -10,6 +11,8 @@ from cosmic_memory.graph.models import GraphDocument, GraphEpisode
 
 if TYPE_CHECKING:
     from cosmic_memory.extraction.base import GraphExtractionService
+
+logger = logging.getLogger(__name__)
 
 
 def graph_document_from_memory_record(record: MemoryRecord) -> GraphDocument | None:
@@ -42,6 +45,8 @@ async def ensure_graph_document_for_record(
     record: MemoryRecord,
     *,
     extractor: "GraphExtractionService | None" = None,
+    llm_extractor: "GraphExtractionService | None" = None,
+    allow_llm: bool = True,
 ) -> GraphDocument | None:
     from cosmic_memory.extraction.normalize import normalize_extraction_result
 
@@ -51,16 +56,52 @@ async def ensure_graph_document_for_record(
         record.metadata["graph_document"] = document.model_dump(mode="json")
         return document
 
-    if extractor is None or not should_extract_graph_for_record(record):
+    if not should_extract_graph_for_record(record):
         return None
 
-    extraction_result = await extractor.extract(record)
+    if extractor is not None:
+        extraction_result = await extractor.extract(record)
+        if extraction_result is not None:
+            document, report = normalize_extraction_result(extraction_result, record=record)
+            record.metadata["graph_extraction"] = {
+                "mode": "deterministic",
+                "model": getattr(extractor, "model_name", None),
+                "extracted_at": utc_now().isoformat(),
+                "input_entity_count": report.input_entity_count,
+                "output_entity_count": report.output_entity_count,
+                "input_relation_count": report.input_relation_count,
+                "output_relation_count": report.output_relation_count,
+                "merged_entity_count": report.merged_entity_count,
+                "dropped_entity_count": report.dropped_entity_count,
+                "dropped_relation_count": report.dropped_relation_count,
+                "rationale": extraction_result.rationale,
+            }
+            if document is not None:
+                document.episode = _coerce_episode_for_record(record, document)
+                record.metadata["graph_document"] = document.model_dump(mode="json")
+                logger.info(
+                    "memory.graph_document_prepared memory_id=%s mode=deterministic entities=%s relations=%s",
+                    record.memory_id,
+                    len(document.entities),
+                    len(document.relations),
+                )
+                return document
+            logger.info(
+                "memory.graph_document_skipped memory_id=%s mode=deterministic rationale=%s",
+                record.memory_id,
+                extraction_result.rationale or "none",
+            )
+
+    if not allow_llm or llm_extractor is None:
+        return None
+
+    extraction_result = await llm_extractor.extract(record)
     if extraction_result is None:
         return None
     document, report = normalize_extraction_result(extraction_result, record=record)
     record.metadata["graph_extraction"] = {
-        "mode": "auto",
-        "model": getattr(extractor, "model_name", None),
+        "mode": "llm",
+        "model": getattr(llm_extractor, "model_name", None),
         "extracted_at": utc_now().isoformat(),
         "input_entity_count": report.input_entity_count,
         "output_entity_count": report.output_entity_count,
@@ -74,6 +115,18 @@ async def ensure_graph_document_for_record(
     if document is not None:
         document.episode = _coerce_episode_for_record(record, document)
         record.metadata["graph_document"] = document.model_dump(mode="json")
+        logger.info(
+            "memory.graph_document_prepared memory_id=%s mode=llm entities=%s relations=%s",
+            record.memory_id,
+            len(document.entities),
+            len(document.relations),
+        )
+        return document
+    logger.info(
+        "memory.graph_document_skipped memory_id=%s mode=llm rationale=%s",
+        record.memory_id,
+        extraction_result.rationale or "none",
+    )
     return document
 
 

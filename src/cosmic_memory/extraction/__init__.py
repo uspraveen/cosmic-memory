@@ -1,6 +1,7 @@
 """Graph extraction services and helpers."""
 
 from cosmic_memory.extraction.base import GraphExtractionService
+from cosmic_memory.extraction.deterministic import DeterministicGraphExtractionService
 from cosmic_memory.extraction.models import (
     ExtractedGraphEntity,
     ExtractedGraphRelation,
@@ -14,6 +15,7 @@ from cosmic_memory.extraction.normalize import (
 from cosmic_memory.extraction.xai import XAIGraphExtractionService
 
 __all__ = [
+    "DeterministicGraphExtractionService",
     "ExtractedGraphEntity",
     "ExtractedGraphRelation",
     "GraphDocumentNormalizationReport",

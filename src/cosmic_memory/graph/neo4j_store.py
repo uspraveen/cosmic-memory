@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 import logging
 
-from cosmic_memory.domain.models import utc_now
+from cosmic_memory.domain.models import GraphStoreStats, utc_now
 from cosmic_memory.graph.dev_store import InMemoryGraphStore
 from cosmic_memory.graph.adjudication import (
     EntityAdjudicationRequest,
@@ -263,6 +263,47 @@ class Neo4jGraphStore:
                 await self.entity_index.delete_entities(entities_to_delete)
             if entities_to_sync:
                 await self.entity_index.sync_entities(entities_to_sync)
+
+    async def reset(self) -> None:
+        await self._ensure_ready()
+        entity_ids: list[str] = []
+        if self.entity_index is not None:
+            async with self.driver.session(database=self.database) as session:
+                result = await session.run("MATCH (e:Entity) RETURN e.entity_id AS entity_id")
+                async for row in result:
+                    entity_ids.append(row["entity_id"])
+        async with self.driver.session(database=self.database) as session:
+            await session.run("MATCH (n) DETACH DELETE n")
+        if self.entity_index is not None and entity_ids:
+            await self.entity_index.delete_entities(entity_ids)
+        async with self._cache_lock:
+            self._search_cache = None
+
+    async def stats(self) -> GraphStoreStats:
+        await self._ensure_ready()
+        async with self.driver.session(database=self.database) as session:
+            memory_result = await session.run(
+                "MATCH (ep:Episode) RETURN count(DISTINCT ep.memory_id) AS count"
+            )
+            entity_result = await session.run("MATCH (e:Entity) RETURN count(e) AS count")
+            relation_result = await session.run("MATCH (r:Relation) RETURN count(r) AS count")
+            episode_result = await session.run("MATCH (ep:Episode) RETURN count(ep) AS count")
+            key_result = await session.run(
+                "MATCH (k:IdentityKey) RETURN count(k) AS count"
+            )
+            memory_row = await memory_result.single()
+            entity_row = await entity_result.single()
+            relation_row = await relation_result.single()
+            episode_row = await episode_result.single()
+            key_row = await key_result.single()
+        return GraphStoreStats(
+            backend="neo4j",
+            memory_count=int(memory_row["count"] if memory_row is not None else 0),
+            entity_count=int(entity_row["count"] if entity_row is not None else 0),
+            relation_count=int(relation_row["count"] if relation_row is not None else 0),
+            episode_count=int(episode_row["count"] if episode_row is not None else 0),
+            identity_key_count=int(key_row["count"] if key_row is not None else 0),
+        )
 
     async def resolve_identity(
         self, candidate: GraphIdentityCandidate
