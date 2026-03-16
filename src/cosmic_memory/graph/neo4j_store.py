@@ -287,9 +287,7 @@ class Neo4jGraphStore:
     async def stats(self) -> GraphStoreStats:
         await self._ensure_ready()
         async with self.driver.session(database=self.database) as session:
-            memory_result = await session.run(
-                "MATCH (ep:Episode) RETURN count(DISTINCT ep.memory_id) AS count"
-            )
+            memory_result = await session.run("MATCH (ep:Episode) RETURN count(ep) AS count")
             entity_result = await session.run("MATCH (e:Entity) RETURN count(e) AS count")
             relation_result = await session.run("MATCH (r:Relation) RETURN count(r) AS count")
             episode_result = await session.run("MATCH (ep:Episode) RETURN count(ep) AS count")

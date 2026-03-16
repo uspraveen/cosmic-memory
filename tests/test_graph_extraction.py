@@ -399,6 +399,86 @@ def test_sync_graph_can_limit_llm_backfill_to_missing_documents():
     asyncio.run(run())
 
 
+def test_sync_graph_continues_after_record_failure_and_reports_failed_ids():
+    class FlakyLLMExtractor:
+        model_name = "fake-llm"
+
+        async def extract(self, record):
+            if "fails" in record.title.lower():
+                raise RuntimeError("synthetic extractor failure")
+            return GraphExtractionResult(
+                should_extract=True,
+                rationale="capture stable preference relation",
+                entities=[
+                    ExtractedGraphEntity(
+                        local_ref="user",
+                        entity_type=EntityType.PERSON,
+                        canonical_name="Praveen",
+                    ),
+                    ExtractedGraphEntity(
+                        local_ref="topic",
+                        entity_type=EntityType.TOPIC,
+                        canonical_name="Iron Man",
+                    ),
+                ],
+                relations=[
+                    ExtractedGraphRelation(
+                        source_ref="user",
+                        target_ref="topic",
+                        relation_type=RelationType.PREFERS,
+                        fact=record.content,
+                    )
+                ],
+            )
+
+    async def run():
+        from cosmic_memory.filesystem_service import FilesystemMemoryService
+
+        temp_dir = Path(".manual_graph_sync_failure_case")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            service = FilesystemMemoryService(
+                temp_dir,
+                graph_store=InMemoryGraphStore(),
+                graph_extractor=None,
+                graph_llm_extractor=FlakyLLMExtractor(),
+            )
+            good_record = MemoryRecord(
+                kind=MemoryKind.CORE_FACT,
+                title="Works",
+                content="User loves iron man",
+                provenance=provenance(),
+            )
+            bad_record = MemoryRecord(
+                kind=MemoryKind.CORE_FACT,
+                title="Fails extractor",
+                content="User likes thor",
+                provenance=provenance(),
+            )
+            for record in (good_record, bad_record):
+                write_result = service.record_store.write(record)
+                service.registry.upsert(record, write_result.path, write_result.content_hash)
+
+            sync = await service.sync_graph(
+                GraphSyncRequest(
+                    allow_llm=True,
+                    persist_graph_documents=True,
+                    only_missing_graph_documents=True,
+                )
+            )
+
+            assert sync.enabled is True
+            assert sync.graph_upserts == 1
+            assert sync.failed_memory_count == 1
+            assert sync.failed_memory_ids == [bad_record.memory_id]
+            assert sync.status.ingested_memory_count == 1
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
 def test_normalize_extraction_result_backfills_current_relation_valid_at():
     anchor = datetime(2026, 3, 10, 9, 30, tzinfo=UTC)
     record = MemoryRecord(

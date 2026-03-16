@@ -293,6 +293,8 @@ class GraphSyncResponse(BaseModel):
     persisted_graph_document_writes: int = 0
     graph_upserts: int = 0
     graph_removals: int = 0
+    failed_memory_count: int = 0
+    failed_memory_ids: list[str] = Field(default_factory=list)
     llm_backfill_enabled: bool = False
     cache_warmed: bool = False
     status: GraphStatusResponse

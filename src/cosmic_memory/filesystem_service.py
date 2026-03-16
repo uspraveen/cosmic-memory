@@ -1010,6 +1010,8 @@ class FilesystemMemoryService:
                 persisted_graph_document_writes=0,
                 graph_upserts=0,
                 graph_removals=0,
+                failed_memory_count=0,
+                failed_memory_ids=[],
                 llm_backfill_enabled=request.allow_llm,
                 cache_warmed=False,
                 status=status,
@@ -1038,19 +1040,43 @@ class FilesystemMemoryService:
         graph_upserts = 0
         graph_removals = 0
         persisted_graph_document_writes = 0
+        failed_memory_ids: list[str] = []
         target_ids = {record.memory_id for record in target_active_records}
         for record in records:
             if record.status != RecordStatus.ACTIVE:
-                await self.graph_store.remove_memory(record.memory_id)
-                graph_removals += 1
+                try:
+                    await self.graph_store.remove_memory(record.memory_id)
+                    graph_removals += 1
+                except Exception:
+                    failed_memory_ids.append(record.memory_id)
+                    logger.exception(
+                        "memory.graph_record_sync_failed memory_id=%s kind=%s title=%s mode=%s action=remove",
+                        record.memory_id,
+                        record.kind.value,
+                        record.title,
+                        mode,
+                    )
                 continue
             if record.memory_id not in target_ids:
                 continue
-            result, metadata_persisted = await self._sync_graph_record(
-                record,
-                allow_llm=request.allow_llm,
-                persist_graph_document=request.persist_graph_documents,
-            )
+            try:
+                result, metadata_persisted = await self._sync_graph_record(
+                    record,
+                    allow_llm=request.allow_llm,
+                    persist_graph_document=request.persist_graph_documents,
+                )
+            except Exception:
+                failed_memory_ids.append(record.memory_id)
+                logger.exception(
+                    "memory.graph_record_sync_failed memory_id=%s kind=%s title=%s mode=%s allow_llm=%s persist_graph_document=%s",
+                    record.memory_id,
+                    record.kind.value,
+                    record.title,
+                    mode,
+                    request.allow_llm,
+                    request.persist_graph_documents,
+                )
+                continue
             if result is not None:
                 graph_upserts += 1
             if metadata_persisted:
@@ -1062,10 +1088,11 @@ class FilesystemMemoryService:
 
         status = await self.get_graph_status()
         logger.info(
-            "memory.graph_%s_complete upserts=%s removals=%s persisted_graph_document_writes=%s entities=%s relations=%s episodes=%s cache_ready=%s cache_build_ms=%s",
+            "memory.graph_%s_complete upserts=%s removals=%s failures=%s persisted_graph_document_writes=%s entities=%s relations=%s episodes=%s cache_ready=%s cache_build_ms=%s",
             mode,
             graph_upserts,
             graph_removals,
+            len(failed_memory_ids),
             persisted_graph_document_writes,
             status.entity_count,
             status.relation_count,
@@ -1084,6 +1111,8 @@ class FilesystemMemoryService:
             persisted_graph_document_writes=persisted_graph_document_writes,
             graph_upserts=graph_upserts,
             graph_removals=graph_removals,
+            failed_memory_count=len(failed_memory_ids),
+            failed_memory_ids=failed_memory_ids,
             llm_backfill_enabled=request.allow_llm,
             cache_warmed=cache_warmed,
             status=status,
