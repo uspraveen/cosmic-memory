@@ -507,6 +507,16 @@ class Neo4jGraphStore:
                 "CREATE CONSTRAINT episode_id_unique IF NOT EXISTS FOR (ep:Episode) REQUIRE ep.episode_id IS UNIQUE",
                 "CREATE INDEX identity_key_type_idx IF NOT EXISTS FOR (k:IdentityKey) ON (k.key_type)",
                 "CREATE INDEX relation_type_idx IF NOT EXISTS FOR (r:Relation) ON (r.relation_type)",
+                """
+                MERGE (seed:GraphSchemaSeed {name: 'relation_property_tokens'})
+                SET seed.valid_at = coalesce(seed.valid_at, datetime('1970-01-01T00:00:00Z')),
+                    seed.invalid_at = coalesce(seed.invalid_at, datetime('1970-01-01T00:00:00Z')),
+                    seed.expires_at = coalesce(seed.expires_at, datetime('1970-01-01T00:00:00Z')),
+                    seed.invalidated_by_episode_id = coalesce(
+                        seed.invalidated_by_episode_id,
+                        '__graph_schema_seed__'
+                    )
+                """,
             ):
                 result = await session.run(statement)
                 await result.consume()
