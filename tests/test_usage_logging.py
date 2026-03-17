@@ -16,6 +16,7 @@ from cosmic_memory.ontology_curator import (
     XAIOntologyCuratorService,
 )
 from cosmic_memory.embeddings.perplexity import PerplexityStandardEmbeddingService
+from cosmic_memory.usage import begin_metered_call, build_usage_event, post_usage_event
 
 
 class RecordingUsageLogger:
@@ -225,5 +226,39 @@ def test_xai_ontology_curator_emits_usage() -> None:
         assert event["provider_request_id"] == "xai_curator_req_1"
         assert getattr(event["raw_usage"], "total_tokens") == 14
         assert event["metadata_json"]["alias_label"] == "alma_mater"
+
+    asyncio.run(run())
+
+
+def test_memory_usage_post_accepts_202_response() -> None:
+    class FakeResponse:
+        status_code = 202
+
+        def raise_for_status(self) -> None:
+            return
+
+    class FakeClient:
+        async def post(self, *args, **kwargs):
+            del args, kwargs
+            return FakeResponse()
+
+    async def run() -> None:
+        event = build_usage_event(
+            metered_call=begin_metered_call(prefix="call"),
+            source_component="session_manager",
+            source_id="cosmic-memory",
+            provider="xai",
+            model="grok-4-1-fast-reasoning",
+            usage_kind="chat_completion",
+            operation="memory.graph_extract",
+            raw_usage=SimpleNamespace(prompt_text_tokens=12, output_tokens=4, total_tokens=16),
+        )
+        posted = await post_usage_event(
+            client=FakeClient(),
+            gateway_url="http://127.0.0.1:8080",
+            internal_token="internal-token",
+            event=event,
+        )
+        assert posted is True
 
     asyncio.run(run())

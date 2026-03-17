@@ -238,7 +238,7 @@ async def post_usage_event(
                 json=event,
                 timeout=httpx.Timeout(timeout_sec, connect=min(timeout_sec, 1.5)),
             )
-            if response.status_code in {200, 201}:
+            if response.status_code in {200, 201, 202}:
                 logger.debug(
                     "cosmic_memory.usage_logged llm_call_id=%s operation=%s provider=%s model=%s",
                     event.get("llm_call_id"),
