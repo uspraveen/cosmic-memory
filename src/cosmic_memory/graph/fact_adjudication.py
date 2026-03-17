@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -71,10 +72,22 @@ class FactAdjudicationService(Protocol):
     async def close(self) -> None: ...
 
 
+_EDUCATION_YEAR_PATTERN = re.compile(r"\b((?:19|20)\d{2})\b")
+
+
+def relation_fact_signature_key(relation_type: RelationType, fact: str) -> str:
+    normalized_fact = " ".join(fact.casefold().split())
+    if relation_type in {RelationType.ATTENDED, RelationType.GRADUATED_FROM}:
+        year_match = _EDUCATION_YEAR_PATTERN.search(normalized_fact)
+        year = year_match.group(1) if year_match is not None else ""
+        return f"{relation_type.value}::{year}"
+    return normalized_fact
+
+
 def exact_fact_signature(relation: GraphRelationEdge | PendingFactContext) -> tuple[str, str, str, str]:
     return (
         relation.source_entity_id,
         relation.target_entity_id,
         relation.relation_type.value,
-        " ".join(relation.fact.casefold().split()),
+        relation_fact_signature_key(relation.relation_type, relation.fact),
     )

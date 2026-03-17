@@ -13,6 +13,7 @@ from cosmic_memory.extraction.models import (
     ExtractedGraphRelation,
     GraphExtractionResult,
 )
+from cosmic_memory.graph.fact_adjudication import relation_fact_signature_key
 from cosmic_memory.graph.identity import build_identity_key
 from cosmic_memory.graph.identity import normalize_name_variant
 from cosmic_memory.graph.models import (
@@ -20,7 +21,7 @@ from cosmic_memory.graph.models import (
     GraphDocumentEntity,
     GraphDocumentRelation,
 )
-from cosmic_memory.graph.ontology import IdentityKeyType, RelationType
+from cosmic_memory.graph.ontology import EntityType, IdentityKeyType, RelationType
 from cosmic_memory.graph.resolution import (
     STRONG_KEY_TYPES,
     entity_allows_name_auto_merge,
@@ -31,6 +32,8 @@ from cosmic_memory.graph.resolution import (
 _CURRENT_STATE_RELATIONS = {
     RelationType.WORKS_ON,
     RelationType.PART_OF,
+    RelationType.ATTENDED,
+    RelationType.GRADUATED_FROM,
     RelationType.PREFERS,
     RelationType.AVOIDS,
     RelationType.BLOCKED_BY,
@@ -51,6 +54,17 @@ _ABSOLUTE_DATE_PATTERN = re.compile(
     r")\b",
     flags=re.IGNORECASE,
 )
+_EDUCATION_ATTEND_PATTERN = re.compile(
+    r"\b(attend(?:ed|ing)?|went to|studied at|alma mater)\b",
+    flags=re.IGNORECASE,
+)
+_EDUCATION_GRADUATION_PATTERN = re.compile(
+    r"\b(graduat(?:e|ed|ing)|degree from|graduation)\b",
+    flags=re.IGNORECASE,
+)
+_TRAILING_ALIAS_PATTERN = re.compile(
+    r"^(?P<canonical>.+?)\s*\((?P<alias>[A-Za-z0-9][A-Za-z0-9 .&'/-]{1,31})\)\s*$"
+)
 
 
 @dataclass(slots=True)
@@ -62,6 +76,7 @@ class GraphDocumentNormalizationReport:
     merged_entity_count: int
     dropped_entity_count: int
     dropped_relation_count: int
+    rewritten_relation_count: int
 
 
 @dataclass(slots=True)
@@ -85,6 +100,7 @@ def normalize_extraction_result(
             merged_entity_count=0,
             dropped_entity_count=len(result.entities),
             dropped_relation_count=len(result.relations),
+            rewritten_relation_count=0,
         )
 
     document, report = normalize_graph_document(
@@ -119,6 +135,7 @@ def normalize_graph_document(
     input_relation_count = len(document.relations)
     dropped_entities = 0
     merged_count = 0
+    rewritten_relation_count = 0
 
     for index, entity in enumerate(document.entities):
         normalized_entity = _normalize_entity(entity, index=index)
@@ -160,10 +177,12 @@ def normalize_graph_document(
     deduped_relations: dict[str, GraphDocumentRelation] = {}
     dropped_relations = 0
     for relation in document.relations:
-        normalized_relation = _normalize_relation(relation, ref_map=ref_map)
+        normalized_relation, rewritten = _normalize_relation(relation, ref_map=ref_map)
         if normalized_relation is None:
             dropped_relations += 1
             continue
+        if rewritten:
+            rewritten_relation_count += 1
         key = _relation_dedup_key(normalized_relation)
         existing = deduped_relations.get(key)
         if existing is None:
@@ -184,6 +203,7 @@ def normalize_graph_document(
         merged_entity_count=merged_count,
         dropped_entity_count=dropped_entities,
         dropped_relation_count=dropped_relations + max(input_relation_count - len(deduped_relations) - dropped_relations, 0),
+        rewritten_relation_count=rewritten_relation_count,
     )
     if not output_entities and not output_relations:
         return None, report
@@ -207,7 +227,11 @@ def _normalize_entity(entity: GraphDocumentEntity, *, index: int) -> GraphDocume
         return None
 
     local_ref = _normalize_local_ref(entity.local_ref, index=index)
-    alias_values = _dedup_aliases([*entity.alias_values, canonical_name])
+    canonical_name, derived_aliases = _split_trailing_alias(
+        canonical_name,
+        entity_type=entity.entity_type,
+    )
+    alias_values = _dedup_aliases([*entity.alias_values, *derived_aliases, canonical_name])
     identity_candidates = _dedup_identity_candidates(entity.identity_candidates)
     attributes = {
         key: value
@@ -228,25 +252,31 @@ def _normalize_relation(
     relation: GraphDocumentRelation,
     *,
     ref_map: dict[str, str],
-) -> GraphDocumentRelation | None:
+) -> tuple[GraphDocumentRelation | None, bool]:
     source_ref = ref_map.get(relation.source_ref, relation.source_ref)
     target_ref = ref_map.get(relation.target_ref, relation.target_ref)
     if not source_ref or not target_ref or source_ref == target_ref:
-        return None
+        return None, False
 
     fact = _normalize_whitespace(relation.fact)
     if not fact:
-        return None
+        return None, False
 
-    return GraphDocumentRelation(
-        source_ref=source_ref,
-        target_ref=target_ref,
-        relation_type=relation.relation_type,
-        fact=fact,
-        confidence=max(0.0, min(relation.confidence, 1.0)),
-        valid_at=relation.valid_at,
-        invalid_at=relation.invalid_at,
-        expires_at=relation.expires_at,
+    normalized_relation_type = _rewrite_relation_type(relation.relation_type, fact)
+    rewritten = normalized_relation_type != relation.relation_type
+
+    return (
+        GraphDocumentRelation(
+            source_ref=source_ref,
+            target_ref=target_ref,
+            relation_type=normalized_relation_type,
+            fact=fact,
+            confidence=max(0.0, min(relation.confidence, 1.0)),
+            valid_at=relation.valid_at,
+            invalid_at=relation.invalid_at,
+            expires_at=relation.expires_at,
+        ),
+        rewritten,
     )
 
 
@@ -372,7 +402,7 @@ def _relation_dedup_key(relation: GraphDocumentRelation) -> str:
             relation.source_ref,
             relation.target_ref,
             relation.relation_type.value,
-            _safe_name_key(relation.fact),
+            relation_fact_signature_key(relation.relation_type, relation.fact),
             relation.valid_at.isoformat() if relation.valid_at else "",
             relation.invalid_at.isoformat() if relation.invalid_at else "",
             relation.expires_at.isoformat() if relation.expires_at else "",
@@ -390,3 +420,26 @@ def _safe_name_key(value: str) -> str:
         return normalize_name_variant(value)
     except ValueError:
         return ""
+
+
+def _rewrite_relation_type(relation_type: RelationType, fact: str) -> RelationType:
+    if relation_type != RelationType.PART_OF:
+        return relation_type
+    if _EDUCATION_GRADUATION_PATTERN.search(fact):
+        return RelationType.GRADUATED_FROM
+    if _EDUCATION_ATTEND_PATTERN.search(fact):
+        return RelationType.ATTENDED
+    return relation_type
+
+
+def _split_trailing_alias(value: str, *, entity_type: EntityType) -> tuple[str, list[str]]:
+    if entity_type == EntityType.PERSON:
+        return value, []
+    match = _TRAILING_ALIAS_PATTERN.match(value)
+    if match is None:
+        return value, []
+    canonical = _normalize_whitespace(match.group("canonical"))
+    alias = _normalize_whitespace(match.group("alias"))
+    if not canonical or not alias or canonical.casefold() == alias.casefold():
+        return value, []
+    return canonical, [alias, value]

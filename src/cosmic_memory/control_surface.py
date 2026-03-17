@@ -22,6 +22,8 @@ from cosmic_memory.retrieval import build_query_signals
 CURRENT_STATE_RELATION_TYPES = {
     RelationType.WORKS_ON.value,
     RelationType.PART_OF.value,
+    RelationType.ATTENDED.value,
+    RelationType.GRADUATED_FROM.value,
     RelationType.PREFERS.value,
     RelationType.AVOIDS.value,
     RelationType.BLOCKED_BY.value,
@@ -32,6 +34,8 @@ TEMPORAL_RELATION_TYPES = {
     RelationType.SUPERSEDES.value,
     RelationType.VALID_DURING.value,
     RelationType.DECIDED.value,
+    RelationType.ATTENDED.value,
+    RelationType.GRADUATED_FROM.value,
 }
 
 

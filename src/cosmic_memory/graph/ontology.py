@@ -32,6 +32,8 @@ class RelationType(StrEnum):
     HAS_IDENTITY_KEY = "has_identity_key"
     WORKS_ON = "works_on"
     PART_OF = "part_of"
+    ATTENDED = "attended"
+    GRADUATED_FROM = "graduated_from"
     MENTIONS = "mentions"
     PREFERS = "prefers"
     AVOIDS = "avoids"
@@ -55,6 +57,8 @@ INTENT_RELATION_MAP: dict[QueryIntent, set[RelationType]] = {
     QueryIntent.GENERIC: {
         RelationType.WORKS_ON,
         RelationType.PART_OF,
+        RelationType.ATTENDED,
+        RelationType.GRADUATED_FROM,
         RelationType.MENTIONS,
         RelationType.DECIDED,
         RelationType.KNOWS,
@@ -68,6 +72,8 @@ INTENT_RELATION_MAP: dict[QueryIntent, set[RelationType]] = {
         RelationType.KNOWS,
         RelationType.WORKS_ON,
         RelationType.PART_OF,
+        RelationType.ATTENDED,
+        RelationType.GRADUATED_FROM,
         RelationType.DECIDED,
         RelationType.BLOCKED_BY,
     },
@@ -80,6 +86,8 @@ INTENT_RELATION_MAP: dict[QueryIntent, set[RelationType]] = {
     QueryIntent.TASK_LOOKUP: {
         RelationType.WORKS_ON,
         RelationType.PART_OF,
+        RelationType.ATTENDED,
+        RelationType.GRADUATED_FROM,
         RelationType.BLOCKED_BY,
         RelationType.DECIDED,
         RelationType.MENTIONS,
@@ -91,6 +99,16 @@ _RELATION_COMPATIBILITY_MAP: dict[RelationType, set[RelationType]] = {
     RelationType.HAS_IDENTITY_KEY: {RelationType.HAS_IDENTITY_KEY},
     RelationType.WORKS_ON: {RelationType.WORKS_ON, RelationType.PART_OF},
     RelationType.PART_OF: {RelationType.PART_OF, RelationType.WORKS_ON},
+    RelationType.ATTENDED: {
+        RelationType.ATTENDED,
+        RelationType.GRADUATED_FROM,
+        RelationType.PART_OF,
+    },
+    RelationType.GRADUATED_FROM: {
+        RelationType.GRADUATED_FROM,
+        RelationType.ATTENDED,
+        RelationType.PART_OF,
+    },
     RelationType.MENTIONS: {RelationType.MENTIONS},
     RelationType.PREFERS: {RelationType.PREFERS, RelationType.AVOIDS},
     RelationType.AVOIDS: {RelationType.AVOIDS, RelationType.PREFERS},

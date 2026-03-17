@@ -23,6 +23,7 @@ from cosmic_memory.graph.fact_adjudication import (
     FactCandidateContext,
     PendingFactContext,
     exact_fact_signature,
+    relation_fact_signature_key,
 )
 from cosmic_memory.graph.entity_index import EntitySimilarityIndex, entity_similarity_text_parts
 from cosmic_memory.graph.identity import build_identity_key
@@ -1648,7 +1649,7 @@ def _deterministic_invalidation_candidate_ids(
         return []
 
     invalidated_ids: list[str] = []
-    pending_fact_key = " ".join(pending.fact.casefold().split())
+    pending_fact_key = relation_fact_signature_key(pending.relation_type, pending.fact)
     for candidate in candidates:
         if candidate.invalidated_by_episode_id is not None:
             continue
@@ -1665,7 +1666,10 @@ def _deterministic_invalidation_candidate_ids(
         if pending_effective_valid_at <= candidate_effective_valid_at:
             continue
 
-        candidate_fact_key = " ".join(candidate.fact.casefold().split())
+        candidate_fact_key = relation_fact_signature_key(
+            candidate.relation_type,
+            candidate.fact,
+        )
         if candidate_fact_key == pending_fact_key:
             continue
 

@@ -57,6 +57,32 @@ _RELATION_PATTERNS: tuple[tuple[RelationType, EntityType, tuple[re.Pattern[str],
         "deterministic_work_relation",
     ),
     (
+        RelationType.ATTENDED,
+        EntityType.ORGANIZATION,
+        (
+            re.compile(
+                rf"^\s*(?:{_FIRST_PERSON_PREFIX})\s+(?:attended|went\s+to|studied\s+at)\s+(?P<value>.+?)\s*\.?\s*$",
+                re.IGNORECASE,
+            ),
+        ),
+        "deterministic_attended_relation",
+    ),
+    (
+        RelationType.GRADUATED_FROM,
+        EntityType.ORGANIZATION,
+        (
+            re.compile(
+                rf"^\s*(?:{_FIRST_PERSON_PREFIX})\s+graduated\s+from\s+(?P<value>.+?)\s*\.?\s*$",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"^\s*(?:{_FIRST_PERSON_PREFIX})\s+got\s+(?:my|the)\s+degree\s+from\s+(?P<value>.+?)\s*\.?\s*$",
+                re.IGNORECASE,
+            ),
+        ),
+        "deterministic_graduated_relation",
+    ),
+    (
         RelationType.DECIDED,
         EntityType.GOAL,
         (
@@ -133,8 +159,14 @@ class DeterministicGraphExtractionService:
                 if match is None:
                     continue
                 value = _clean_object_phrase(match.group("value"))
+                if relation_type in {RelationType.ATTENDED, RelationType.GRADUATED_FROM}:
+                    value = _strip_education_temporal_suffix(value)
                 if not value:
                     continue
+                canonical_target_name, target_aliases = _split_parenthetical_alias(
+                    _canonicalize_object_name(value),
+                    entity_type=entity_type,
+                )
                 return GraphExtractionResult(
                     should_extract=True,
                     rationale=rationale,
@@ -143,8 +175,13 @@ class DeterministicGraphExtractionService:
                         ExtractedGraphEntity(
                             local_ref="fact_target",
                             entity_type=entity_type,
-                            canonical_name=_canonicalize_object_name(value),
-                            alias_values=[value] if value != _canonicalize_object_name(value) else [],
+                            canonical_name=canonical_target_name,
+                            alias_values=_dedup_alias_values(
+                                [
+                                    value if value != canonical_target_name else "",
+                                    *target_aliases,
+                                ]
+                            ),
                         ),
                     ],
                     relations=[
@@ -154,7 +191,10 @@ class DeterministicGraphExtractionService:
                             relation_type=relation_type,
                             fact=_ensure_terminal_period(content),
                             confidence=0.88,
-                            valid_at=record.provenance.created_at,
+                            valid_at=_default_relation_valid_at(
+                                relation_type=relation_type,
+                                record=record,
+                            ),
                         )
                     ],
                 )
@@ -225,3 +265,56 @@ def _ensure_terminal_period(value: str) -> str:
     if trimmed.endswith((".", "!", "?")):
         return trimmed
     return f"{trimmed}."
+
+
+_EDUCATION_SUFFIX_PATTERNS = (
+    re.compile(r"\s*,?\s*class\s+of\s+\d{4}\s*$", re.IGNORECASE),
+    re.compile(r"\s+in\s+\d{4}\s*$", re.IGNORECASE),
+    re.compile(r"\s+from\s+\d{4}\s+to\s+\d{4}\s*$", re.IGNORECASE),
+)
+_TRAILING_ALIAS_PATTERN = re.compile(
+    r"^(?P<canonical>.+?)\s*\((?P<alias>[A-Za-z0-9][A-Za-z0-9 .&'/-]{1,31})\)\s*$"
+)
+
+
+def _strip_education_temporal_suffix(value: str) -> str:
+    cleaned = value
+    for pattern in _EDUCATION_SUFFIX_PATTERNS:
+        cleaned = pattern.sub("", cleaned).strip()
+    return cleaned
+
+
+def _split_parenthetical_alias(value: str, *, entity_type: EntityType) -> tuple[str, list[str]]:
+    if entity_type != EntityType.ORGANIZATION:
+        return value, []
+    match = _TRAILING_ALIAS_PATTERN.match(value)
+    if match is None:
+        return value, []
+    canonical = _clean_phrase(match.group("canonical"))
+    alias = _clean_phrase(match.group("alias"))
+    if not canonical or not alias or canonical.casefold() == alias.casefold():
+        return value, []
+    return canonical, [alias, value]
+
+
+def _dedup_alias_values(values: list[str]) -> list[str]:
+    deduped: dict[str, str] = {}
+    for value in values:
+        normalized = _clean_phrase(value)
+        if not normalized:
+            continue
+        key = normalized.casefold()
+        existing = deduped.get(key)
+        if existing is None or len(normalized) > len(existing):
+            deduped[key] = normalized
+    return list(deduped.values())
+
+
+def _default_relation_valid_at(
+    *,
+    relation_type: RelationType,
+    record: MemoryRecord,
+):
+    if relation_type in {RelationType.ATTENDED, RelationType.GRADUATED_FROM}:
+        return None
+    return record.provenance.created_at

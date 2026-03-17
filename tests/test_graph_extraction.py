@@ -204,6 +204,41 @@ def test_deterministic_extractor_can_capture_primary_user_preference():
     asyncio.run(run())
 
 
+def test_deterministic_extractor_can_capture_primary_user_education_relation():
+    async def run():
+        service = InMemoryDevelopmentMemoryService(
+            graph_store=InMemoryGraphStore(),
+            graph_extractor=DeterministicGraphExtractionService(
+                primary_user_display_name="Praveen"
+            ),
+        )
+        record = await service.write(
+            WriteMemoryRequest(
+                kind=MemoryKind.USER_DATA,
+                title="Education",
+                content="I graduated from University of Pennsylvania (UPenn) in 2022.",
+                provenance=provenance(),
+            )
+        )
+
+        document = record.metadata["graph_document"]
+        institution = next(
+            entity for entity in document["entities"] if entity["entity_type"] == "organization"
+        )
+        assert institution["canonical_name"] == "University of Pennsylvania"
+        assert "UPenn" in institution["alias_values"]
+        assert document["relations"][0]["relation_type"] == "graduated_from"
+
+        response = await service.active_recall(
+            ActiveRecallRequest(query="Where did Praveen graduate from?")
+        )
+
+        assert response.relations
+        assert response.relations[0].relation_type == "graduated_from"
+
+    asyncio.run(run())
+
+
 def test_sync_graph_can_backfill_deterministic_documents_without_llm():
     async def run():
         seed_service = InMemoryDevelopmentMemoryService()
@@ -247,6 +282,127 @@ def test_sync_graph_can_backfill_deterministic_documents_without_llm():
     asyncio.run(run())
 
 
+def test_normalize_extraction_result_rewrites_legacy_part_of_education_relation():
+    record = MemoryRecord(
+        memory_id="mem_education_rewrite",
+        kind=MemoryKind.USER_DATA,
+        title="Education",
+        content="Praveen graduated from University of Pennsylvania (UPenn) in 2022.",
+        provenance=provenance(),
+    )
+
+    result, report = normalize_extraction_result(
+        GraphExtractionResult(
+            should_extract=True,
+            entities=[
+                ExtractedGraphEntity(
+                    local_ref="user",
+                    entity_type=EntityType.PERSON,
+                    canonical_name="Praveen",
+                ),
+                ExtractedGraphEntity(
+                    local_ref="school",
+                    entity_type=EntityType.ORGANIZATION,
+                    canonical_name="University of Pennsylvania (UPenn)",
+                ),
+            ],
+            relations=[
+                ExtractedGraphRelation(
+                    source_ref="user",
+                    target_ref="school",
+                    relation_type=RelationType.PART_OF,
+                    fact="Praveen graduated from University of Pennsylvania (UPenn) in 2022.",
+                )
+            ],
+        ),
+        record=record,
+    )
+
+    assert result is not None
+    assert report.rewritten_relation_count == 1
+    assert result.entities[1].canonical_name == "University of Pennsylvania"
+    assert "UPenn" in result.entities[1].alias_values
+    assert result.relations[0].relation_type == RelationType.GRADUATED_FROM
+
+
+def test_graph_store_merges_semantically_equivalent_graduation_facts():
+    class SequencedExtractor:
+        model_name = "sequenced-education"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def extract(self, _record):
+            self.calls += 1
+            fact = (
+                "Praveen graduated from UPenn in 2022."
+                if self.calls == 1
+                else "Praveen graduated from the University of Pennsylvania (UPenn) in 2022."
+            )
+            return GraphExtractionResult(
+                should_extract=True,
+                rationale="education_relation",
+                entities=[
+                    ExtractedGraphEntity(
+                        local_ref="user",
+                        entity_type=EntityType.PERSON,
+                        canonical_name="Praveen",
+                        identity_candidates=[
+                            GraphIdentityCandidate(
+                                key_type=IdentityKeyType.EXTERNAL_ACCOUNT,
+                                provider="cosmic",
+                                raw_value="primary_user",
+                                verified=True,
+                            )
+                        ],
+                    ),
+                    ExtractedGraphEntity(
+                        local_ref="school",
+                        entity_type=EntityType.ORGANIZATION,
+                        canonical_name="University of Pennsylvania (UPenn)",
+                    ),
+                ],
+                relations=[
+                    ExtractedGraphRelation(
+                        source_ref="user",
+                        target_ref="school",
+                        relation_type=RelationType.GRADUATED_FROM,
+                        fact=fact,
+                    )
+                ],
+            )
+
+        async def close(self):
+            return None
+
+    async def run():
+        service = InMemoryDevelopmentMemoryService(
+            graph_store=InMemoryGraphStore(),
+            graph_extractor=SequencedExtractor(),
+        )
+        for title in ("Education one", "Education two"):
+            await service.write(
+                WriteMemoryRequest(
+                    kind=MemoryKind.USER_DATA,
+                    title=title,
+                    content=title,
+                    provenance=provenance(),
+                )
+            )
+
+        response = await service.active_recall(
+            ActiveRecallRequest(query="Where did Praveen graduate from?")
+        )
+
+        graduation_relations = [
+            relation for relation in response.relations if relation.relation_type == "graduated_from"
+        ]
+        assert len(graduation_relations) == 1
+        assert len(graduation_relations[0].memory_ids) == 2
+
+    asyncio.run(run())
+
+
 def test_sync_graph_can_persist_backfilled_graph_documents():
     async def run():
         from cosmic_memory.filesystem_service import FilesystemMemoryService
@@ -284,6 +440,77 @@ def test_sync_graph_can_persist_backfilled_graph_documents():
             assert sync.status.persisted_graph_document_count == 1
             assert reloaded.metadata["graph_document"]["entities"][0]["canonical_name"] == "Praveen"
             assert reloaded.metadata["graph_extraction"]["mode"] == "deterministic"
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    asyncio.run(run())
+
+
+def test_sync_graph_can_rewrite_persisted_legacy_education_relations_without_llm():
+    async def run():
+        from cosmic_memory.filesystem_service import FilesystemMemoryService
+
+        temp_dir = Path(".manual_graph_sync_rewrite_case")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            service = FilesystemMemoryService(
+                temp_dir,
+                graph_store=InMemoryGraphStore(),
+                graph_extractor=DeterministicGraphExtractionService(
+                    primary_user_display_name="Praveen"
+                ),
+            )
+            record = MemoryRecord(
+                kind=MemoryKind.USER_DATA,
+                title="Education",
+                content="Praveen graduated from University of Pennsylvania (UPenn) in 2022.",
+                metadata={
+                    "graph_document": {
+                        "memory_id": "ignored",
+                        "entities": [
+                            {
+                                "local_ref": "user",
+                                "entity_type": "person",
+                                "canonical_name": "Praveen",
+                            },
+                            {
+                                "local_ref": "school",
+                                "entity_type": "organization",
+                                "canonical_name": "University of Pennsylvania (UPenn)",
+                            },
+                        ],
+                        "relations": [
+                            {
+                                "source_ref": "user",
+                                "target_ref": "school",
+                                "relation_type": "part_of",
+                                "fact": "Praveen graduated from University of Pennsylvania (UPenn) in 2022.",
+                            }
+                        ],
+                    }
+                },
+                provenance=provenance(),
+            )
+            write_result = service.record_store.write(record)
+            service.registry.upsert(record, write_result.path, write_result.content_hash)
+
+            sync = await service.sync_graph(
+                GraphSyncRequest(
+                    persist_graph_documents=True,
+                    only_missing_graph_documents=False,
+                )
+            )
+            reloaded = service.record_store.read(write_result.path)
+
+            assert sync.enabled is True
+            assert sync.persisted_graph_document_writes == 1
+            assert reloaded.metadata["graph_document"]["relations"][0]["relation_type"] == "graduated_from"
+            assert (
+                reloaded.metadata["graph_document"]["entities"][1]["canonical_name"]
+                == "University of Pennsylvania"
+            )
+            assert "UPenn" in reloaded.metadata["graph_document"]["entities"][1]["alias_values"]
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -659,5 +886,7 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
         assert "Provenance created_at:" in user_message
         assert "primary_user_display_name: Praveen" in user_message
         assert "Today Cosmic Memory is blocked by embedding latency." in user_message
+        assert "graduated_from" in user_message
+        assert "attended" in user_message
 
     asyncio.run(run())

@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cosmic_memory.domain.models import MemoryRecord
 from cosmic_memory.extraction.models import GraphExtractionResult
+from cosmic_memory.graph.ontology import EntityType, RelationType
 
 _SYSTEM_PROMPT = """You extract structured graph memory for Cosmic.
 
@@ -28,6 +29,10 @@ Rules:
 - For relative time expressions such as today, yesterday, last week, tomorrow, next Friday, or currently, resolve them against the provided local and UTC time anchors.
 - Use absolute ISO 8601 datetimes when grounded.
 - If a relation is explicitly current, active, blocked, ongoing, or happening today/right now and no more precise timestamp is given, set valid_at to the provided Provenance created_at anchor.
+- Use attended for grounded education attendance or study affiliation with a school, college, or university.
+- Use graduated_from for grounded graduation or degree-completion facts tied to an institution.
+- Do not use part_of for education facts when attended or graduated_from is a better fit.
+- Only emit both attended and graduated_from when the memory explicitly supports both as distinct facts. If the memory only says someone graduated, prefer graduated_from alone.
 - If time is implied but not precise, prefer null over guessing.
 - valid_at means when a fact becomes true.
 - invalid_at means when a fact stops being true.
@@ -144,34 +149,8 @@ def _build_user_prompt(
     provenance = record.provenance.model_dump(mode="json")
     primary_user_name = (primary_user_display_name or "").strip() or "Primary User"
     ontology = {
-        "entity_types": [
-            "person",
-            "organization",
-            "project",
-            "task",
-            "artifact",
-            "preference",
-            "goal",
-            "reminder",
-            "topic",
-            "event",
-            "session",
-            "identity_key",
-        ],
-        "relation_types": [
-            "has_identity_key",
-            "works_on",
-            "part_of",
-            "mentions",
-            "prefers",
-            "avoids",
-            "decided",
-            "blocked_by",
-            "remind_at",
-            "knows",
-            "supersedes",
-            "valid_during",
-        ],
+        "entity_types": [entity_type.value for entity_type in EntityType],
+        "relation_types": [relation_type.value for relation_type in RelationType],
     }
     return f"""Extract graph memory from this canonical Cosmic memory.
 

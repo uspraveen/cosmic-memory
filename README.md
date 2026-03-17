@@ -357,12 +357,15 @@ Graph notes:
 - exact strong keys such as email auto-link entities,
 - weak alias keys do not auto-merge by themselves,
 - non-person entities such as `project`, `task`, and `organization` can auto-merge by exact normalized name,
+- ontology growth is intentionally conservative: new relation types should only be added when they come with deterministic normalization, compatibility rules, and strong duplicate suppression,
 - entity similarity uses a separate Qdrant collection and the same Perplexity embedding model as passive memory,
 - vector similarity is only used for shortlist generation after exact identity and normalized-name checks,
 - ambiguous entity creation and merge decisions can be escalated to an internal xAI adjudicator,
 - ambiguous active-fact conflicts can be escalated to an internal xAI fact adjudicator,
 - ambiguous similarity hits become provisional `candidate_match` results instead of silent auto-merges,
 - write-time extraction stores normalized `graph_document` payloads back into canonical Markdown,
+- obvious education/profile facts now prefer typed relations like `attended` and `graduated_from` instead of falling back to generic `part_of`,
+- graph sync/rebuild can rewrite legacy coarse relations into the conservative typed ontology when canonical memory already contains enough evidence,
 - every ingested graph document now produces a first-class `episode` with source excerpt, timestamps, extraction confidence, and lineage to produced/invalidated relations,
 - graph stores expose structured active-fact lookup internally by entity ids, compatible relation families, active-state filter, and time window,
 - fact invalidation runs on ingestion, not on cron, so current-state traversal does not leak stale facts between writes,
@@ -383,7 +386,8 @@ Graph notes:
 - `POST /v1/graph/sync` and `POST /v1/graph/rebuild` accept an optional control body with `allow_llm`, `persist_graph_documents`, `only_missing_graph_documents`, `max_records`, `memory_ids`, and `warm_cache`,
 - LLM backfill is opt-in on graph sync/rebuild so normal startup syncs do not silently turn into long xAI jobs,
 - persistent graph backfill should persist normalized `graph_document` payloads back into canonical Markdown before ingest so future rebuilds can stay deterministic,
-- the Neo4j backend warms a read-only in-memory search cache so passive and active retrieval keep the same fast scorer semantics after persistence is enabled.
+- the Neo4j backend warms a read-only in-memory search cache so passive and active retrieval keep the same fast scorer semantics after persistence is enabled,
+- graph maintenance is endpoint-driven today: normal correctness comes from ingestion-time extraction, normalization, invalidation, and adjudication, while any overnight job should be a bounded repair/backfill/cache-warm pass rather than the primary consistency mechanism.
 
 Benchmarking:
 

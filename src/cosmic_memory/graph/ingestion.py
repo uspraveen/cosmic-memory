@@ -74,16 +74,18 @@ async def ensure_graph_document_for_record(
                 "merged_entity_count": report.merged_entity_count,
                 "dropped_entity_count": report.dropped_entity_count,
                 "dropped_relation_count": report.dropped_relation_count,
+                "rewritten_relation_count": report.rewritten_relation_count,
                 "rationale": extraction_result.rationale,
             }
             if document is not None:
                 document.episode = _coerce_episode_for_record(record, document)
                 record.metadata["graph_document"] = document.model_dump(mode="json")
                 logger.info(
-                    "memory.graph_document_prepared memory_id=%s mode=deterministic entities=%s relations=%s",
+                    "memory.graph_document_prepared memory_id=%s mode=deterministic entities=%s relations=%s relation_rewrites=%s",
                     record.memory_id,
                     len(document.entities),
                     len(document.relations),
+                    report.rewritten_relation_count,
                 )
                 return document
             logger.info(
@@ -110,16 +112,18 @@ async def ensure_graph_document_for_record(
         "merged_entity_count": report.merged_entity_count,
         "dropped_entity_count": report.dropped_entity_count,
         "dropped_relation_count": report.dropped_relation_count,
+        "rewritten_relation_count": report.rewritten_relation_count,
         "rationale": extraction_result.rationale,
     }
     if document is not None:
         document.episode = _coerce_episode_for_record(record, document)
         record.metadata["graph_document"] = document.model_dump(mode="json")
         logger.info(
-            "memory.graph_document_prepared memory_id=%s mode=llm entities=%s relations=%s",
+            "memory.graph_document_prepared memory_id=%s mode=llm entities=%s relations=%s relation_rewrites=%s",
             record.memory_id,
             len(document.entities),
             len(document.relations),
+            report.rewritten_relation_count,
         )
         return document
     logger.info(
