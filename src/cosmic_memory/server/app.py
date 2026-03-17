@@ -21,6 +21,7 @@ from cosmic_memory.domain.models import (
     GenerateEmbeddingsRequest,
     GraphSyncRequest,
     IngestEpisodeRequest,
+    OntologyCurateRequest,
     PassiveRecallRequest,
     SupersedeMemoryRequest,
     WriteCoreFactRequest,
@@ -40,6 +41,7 @@ from cosmic_memory.graph import (
 from cosmic_memory.graph.entity_index import InMemoryEntitySimilarityIndex
 from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
+from cosmic_memory.ontology_curator import XAIOntologyCuratorService
 from cosmic_memory.service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,8 @@ def create_app(
             None,
         )
         await _close_if_present(graph_llm_extractor)
+        ontology_curator = getattr(getattr(app.state, "memory_service", None), "ontology_curator", None)
+        await _close_if_present(ontology_curator)
         graph_store = getattr(getattr(app.state, "memory_service", None), "graph_store", None)
         await _close_if_present(graph_store)
 
@@ -297,6 +301,23 @@ def create_app(
         svc: MemoryService = request.app.state.memory_service
         return await svc.rebuild_graph(payload or GraphSyncRequest())
 
+    @app.get("/v1/ontology/status")
+    async def get_ontology_status(
+        request: Request,
+        _: None = Depends(require_internal_token),
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.get_ontology_status()
+
+    @app.post("/v1/ontology/curate")
+    async def curate_ontology(
+        request: Request,
+        payload: OntologyCurateRequest | None = None,
+        _: None = Depends(require_internal_token),
+    ):
+        svc: MemoryService = request.app.state.memory_service
+        return await svc.curate_ontology(payload or OntologyCurateRequest())
+
     @app.post("/v1/memories/{memory_id}/supersede")
     async def supersede_memory(
         memory_id: str,
@@ -344,6 +365,7 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
     )
     graph_extractor = _build_deterministic_graph_extractor_from_env()
     graph_llm_extractor = _build_graph_extractor_from_env()
+    ontology_curator = _build_ontology_curator_from_env()
     return create_app(
         FilesystemMemoryService(
             data_root,
@@ -351,6 +373,7 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
             graph_store=graph_store,
             graph_extractor=graph_extractor,
             graph_llm_extractor=graph_llm_extractor,
+            ontology_curator=ontology_curator,
             passive_graph_timeout_seconds=float(
                 os.environ.get("COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS", "120")
             )
@@ -359,6 +382,10 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
             graph_write_worker_poll_seconds=_graph_write_worker_poll_seconds(),
             graph_write_retry_base_seconds=_graph_write_retry_base_seconds(),
             graph_write_retry_max_seconds=_graph_write_retry_max_seconds(),
+            ontology_curator_interval_seconds=_ontology_curator_interval_seconds(),
+            ontology_curator_min_observations=_ontology_curator_min_observations(),
+            ontology_curator_max_groups=_ontology_curator_max_groups(),
+            ontology_curator_max_examples_per_group=_ontology_curator_max_examples_per_group(),
         ),
         embedding_service=embedding_service,
     )
@@ -495,6 +522,29 @@ def _graph_write_retry_max_seconds() -> float:
     )
 
 
+def _ontology_curator_interval_seconds() -> float | None:
+    raw = os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_INTERVAL_SECONDS", "0")
+    interval_seconds = float(raw)
+    if interval_seconds <= 0:
+        return None
+    return max(0.1, interval_seconds)
+
+
+def _ontology_curator_min_observations() -> int:
+    return max(1, int(os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_MIN_OBSERVATIONS", "3")))
+
+
+def _ontology_curator_max_groups() -> int:
+    return max(1, int(os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_GROUPS", "8")))
+
+
+def _ontology_curator_max_examples_per_group() -> int:
+    return max(
+        1,
+        int(os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_EXAMPLES_PER_GROUP", "4")),
+    )
+
+
 def _build_graph_store_from_env(
     embedding_service: EmbeddingService,
     *,
@@ -606,6 +656,36 @@ def _build_graph_extractor_from_env():
         ),
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS", "12.0")
+        ),
+    )
+
+
+def _build_ontology_curator_from_env():
+    raw_enabled = os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_ENABLED", "false")
+    if raw_enabled.strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "XAI_API_KEY is required when ontology curation is enabled."
+        )
+    return XAIOntologyCuratorService(
+        api_key=api_key,
+        model_name=os.environ.get(
+            "COSMIC_MEMORY_ONTOLOGY_CURATOR_MODEL",
+            "grok-4-1-fast-reasoning",
+        ),
+        max_parallel_requests=int(
+            os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_PARALLEL", "1")
+        ),
+        max_retries=int(
+            os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_RETRIES", "3")
+        ),
+        retry_base_seconds=float(
+            os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_BASE_SECONDS", "1.0")
+        ),
+        retry_max_seconds=float(
+            os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_MAX_SECONDS", "12.0")
         ),
     )
 

@@ -22,6 +22,9 @@ from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     CoreFactBlock,
     EpisodeIngestResponse,
+    OntologyCurateRequest,
+    OntologyCurateResponse,
+    OntologyStatusResponse,
     GraphStatusResponse,
     GraphSyncRequest,
     GraphSyncResponse,
@@ -82,6 +85,13 @@ class MemoryService(Protocol):
     async def sync_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse: ...
 
     async def rebuild_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse: ...
+
+    async def get_ontology_status(self) -> OntologyStatusResponse: ...
+
+    async def curate_ontology(
+        self,
+        request: OntologyCurateRequest | None = None,
+    ) -> OntologyCurateResponse: ...
 
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest

@@ -11,6 +11,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from cosmic_memory.domain.enums import MemoryKind, RecordStatus
+from cosmic_memory.extraction.models import OntologyObservation
 from cosmic_memory.domain.models import CanonicalMemorySnapshot, MemoryRecord
 
 
@@ -43,6 +44,52 @@ class GraphSyncQueueEntry(BaseModel):
     lease_token: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    last_error: str | None = None
+
+
+class OntologyObservationEntry(BaseModel):
+    observation_id: int
+    memory_id: str
+    source_mode: str
+    observation_kind: str
+    observed_label: str
+    fallback_type: str | None = None
+    fit_level: str
+    confidence: float = 0.5
+    rationale: str | None = None
+    evidence: str | None = None
+    curated_status: str = "pending"
+    curated_run_id: int | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OntologyAliasEntry(BaseModel):
+    alias_id: int
+    observation_kind: str
+    alias_label: str
+    mapped_type: str
+    confidence: float = 0.5
+    rationale: str | None = None
+    evidence_count: int = 0
+    last_curated_run_id: int | None = None
+    status: str = "active"
+    created_at: datetime
+    updated_at: datetime
+
+
+class OntologyCuratorRunEntry(BaseModel):
+    run_id: int
+    trigger: str
+    status: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    scanned_observation_count: int = 0
+    grouped_candidate_count: int = 0
+    alias_upserts: int = 0
+    deferred_group_count: int = 0
+    proposed_new_group_count: int = 0
+    failed_group_count: int = 0
     last_error: str | None = None
 
 
@@ -437,6 +484,355 @@ class SQLiteMemoryRegistry:
                 counts[status] = int(row["count"] or 0)
         return counts
 
+    def replace_ontology_observations(
+        self,
+        *,
+        memory_id: str,
+        source_mode: str,
+        observations: list[OntologyObservation],
+    ) -> int:
+        now = datetime.now().isoformat()
+        inserted = 0
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM ontology_observations
+                WHERE memory_id = ?
+                """,
+                (memory_id,),
+            )
+            for observation in observations:
+                if observation.fit_level not in {"weak", "poor"}:
+                    continue
+                alias_label = _normalize_ontology_label(observation.observed_label)
+                if not alias_label:
+                    continue
+                has_alias = conn.execute(
+                    """
+                    SELECT 1
+                    FROM ontology_aliases
+                    WHERE observation_kind = ?
+                      AND alias_label = ?
+                      AND status = 'active'
+                    LIMIT 1
+                    """,
+                    (observation.observation_kind, alias_label),
+                ).fetchone()
+                if has_alias is not None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO ontology_observations (
+                        memory_id,
+                        source_mode,
+                        observation_kind,
+                        observed_label,
+                        fallback_type,
+                        fit_level,
+                        confidence,
+                        rationale,
+                        evidence,
+                        curated_status,
+                        curated_run_id,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        source_mode,
+                        observation.observation_kind,
+                        alias_label,
+                        observation.fallback_type,
+                        observation.fit_level,
+                        float(observation.confidence),
+                        observation.rationale,
+                        observation.evidence,
+                        now,
+                        now,
+                    ),
+                )
+                inserted += 1
+        return inserted
+
+    def list_pending_ontology_observations(
+        self,
+        *,
+        statuses: list[str] | None = None,
+    ) -> list[OntologyObservationEntry]:
+        selected_statuses = statuses or ["pending"]
+        placeholders = ", ".join("?" for _ in selected_statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM ontology_observations
+                WHERE curated_status IN ({placeholders})
+                ORDER BY created_at ASC, observation_id ASC
+                """,
+                selected_statuses,
+            ).fetchall()
+        return [self._row_to_ontology_observation_entry(row) for row in rows]
+
+    def mark_ontology_observations_status(
+        self,
+        observation_ids: list[int],
+        *,
+        status: str,
+        curated_run_id: int | None = None,
+    ) -> None:
+        if not observation_ids:
+            return
+        placeholders = ", ".join("?" for _ in observation_ids)
+        params: list[object] = [
+            status,
+            curated_run_id,
+            datetime.now().isoformat(),
+            *observation_ids,
+        ]
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE ontology_observations
+                SET curated_status = ?,
+                    curated_run_id = ?,
+                    updated_at = ?
+                WHERE observation_id IN ({placeholders})
+                """,
+                params,
+            )
+
+    def upsert_ontology_alias(
+        self,
+        *,
+        observation_kind: str,
+        alias_label: str,
+        mapped_type: str,
+        confidence: float,
+        rationale: str | None,
+        evidence_count: int,
+        curated_run_id: int | None,
+    ) -> OntologyAliasEntry:
+        normalized_label = _normalize_ontology_label(alias_label)
+        if not normalized_label:
+            raise ValueError("alias_label must not be empty.")
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT alias_id, created_at
+                FROM ontology_aliases
+                WHERE observation_kind = ?
+                  AND alias_label = ?
+                LIMIT 1
+                """,
+                (observation_kind, normalized_label),
+            ).fetchone()
+            if existing is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO ontology_aliases (
+                        observation_kind,
+                        alias_label,
+                        mapped_type,
+                        confidence,
+                        rationale,
+                        evidence_count,
+                        last_curated_run_id,
+                        status,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        observation_kind,
+                        normalized_label,
+                        mapped_type,
+                        float(confidence),
+                        rationale,
+                        evidence_count,
+                        curated_run_id,
+                        now,
+                        now,
+                    ),
+                )
+                alias_id = int(cursor.lastrowid)
+            else:
+                alias_id = int(existing["alias_id"])
+                conn.execute(
+                    """
+                    UPDATE ontology_aliases
+                    SET mapped_type = ?,
+                        confidence = ?,
+                        rationale = ?,
+                        evidence_count = ?,
+                        last_curated_run_id = ?,
+                        status = 'active',
+                        updated_at = ?
+                    WHERE alias_id = ?
+                    """,
+                    (
+                        mapped_type,
+                        float(confidence),
+                        rationale,
+                        evidence_count,
+                        curated_run_id,
+                        now,
+                        alias_id,
+                    ),
+                )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM ontology_aliases
+                WHERE alias_id = ?
+                """,
+                (alias_id,),
+            ).fetchone()
+        return self._row_to_ontology_alias_entry(row)
+
+    def list_active_ontology_aliases(
+        self,
+        *,
+        observation_kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[OntologyAliasEntry]:
+        query = """
+            SELECT *
+            FROM ontology_aliases
+            WHERE status = 'active'
+        """
+        params: list[object] = []
+        if observation_kind is not None:
+            query += " AND observation_kind = ?"
+            params.append(observation_kind)
+        query += " ORDER BY updated_at DESC, alias_id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_ontology_alias_entry(row) for row in rows]
+
+    def ontology_observation_counts(self) -> dict[str, int]:
+        counts = {
+            "pending": 0,
+            "aliased": 0,
+            "deferred": 0,
+            "proposed_new": 0,
+        }
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT curated_status, COUNT(*) AS count
+                FROM ontology_observations
+                GROUP BY curated_status
+                """
+            ).fetchall()
+        for row in rows:
+            status = str(row["curated_status"])
+            if status in counts:
+                counts[status] = int(row["count"] or 0)
+        return counts
+
+    def active_ontology_alias_count(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM ontology_aliases
+                WHERE status = 'active'
+                """
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def begin_ontology_curator_run(self, *, trigger: str) -> OntologyCuratorRunEntry:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ontology_curator_runs (
+                    trigger,
+                    status,
+                    started_at,
+                    completed_at,
+                    scanned_observation_count,
+                    grouped_candidate_count,
+                    alias_upserts,
+                    deferred_group_count,
+                    proposed_new_group_count,
+                    failed_group_count,
+                    last_error
+                ) VALUES (?, 'running', ?, NULL, 0, 0, 0, 0, 0, 0, NULL)
+                """,
+                (trigger, now),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM ontology_curator_runs
+                WHERE run_id = ?
+                """,
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return self._row_to_ontology_curator_run_entry(row)
+
+    def complete_ontology_curator_run(
+        self,
+        *,
+        run_id: int,
+        status: str,
+        scanned_observation_count: int,
+        grouped_candidate_count: int,
+        alias_upserts: int,
+        deferred_group_count: int,
+        proposed_new_group_count: int,
+        failed_group_count: int,
+        last_error: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ontology_curator_runs
+                SET status = ?,
+                    completed_at = ?,
+                    scanned_observation_count = ?,
+                    grouped_candidate_count = ?,
+                    alias_upserts = ?,
+                    deferred_group_count = ?,
+                    proposed_new_group_count = ?,
+                    failed_group_count = ?,
+                    last_error = ?
+                WHERE run_id = ?
+                """,
+                (
+                    status,
+                    datetime.now().isoformat(),
+                    scanned_observation_count,
+                    grouped_candidate_count,
+                    alias_upserts,
+                    deferred_group_count,
+                    proposed_new_group_count,
+                    failed_group_count,
+                    last_error,
+                    run_id,
+                ),
+            )
+
+    def latest_ontology_curator_run(self) -> OntologyCuratorRunEntry | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM ontology_curator_runs
+                ORDER BY run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_ontology_curator_run_entry(row)
+
     def _initialize(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -495,6 +891,91 @@ class SQLiteMemoryRegistry:
                 ON graph_sync_queue(memory_id, queued_at)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ontology_observations (
+                    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    source_mode TEXT NOT NULL,
+                    observation_kind TEXT NOT NULL,
+                    observed_label TEXT NOT NULL,
+                    fallback_type TEXT,
+                    fit_level TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    rationale TEXT,
+                    evidence TEXT,
+                    curated_status TEXT NOT NULL DEFAULT 'pending',
+                    curated_run_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ontology_observations_status_kind
+                ON ontology_observations(curated_status, observation_kind, observed_label, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ontology_observations_memory
+                ON ontology_observations(memory_id, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ontology_aliases (
+                    alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observation_kind TEXT NOT NULL,
+                    alias_label TEXT NOT NULL,
+                    mapped_type TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    rationale TEXT,
+                    evidence_count INTEGER NOT NULL DEFAULT 0,
+                    last_curated_run_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ontology_aliases_kind_label
+                ON ontology_aliases(observation_kind, alias_label)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ontology_aliases_status_updated
+                ON ontology_aliases(status, updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ontology_curator_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trigger TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    scanned_observation_count INTEGER NOT NULL DEFAULT 0,
+                    grouped_candidate_count INTEGER NOT NULL DEFAULT 0,
+                    alias_upserts INTEGER NOT NULL DEFAULT 0,
+                    deferred_group_count INTEGER NOT NULL DEFAULT 0,
+                    proposed_new_group_count INTEGER NOT NULL DEFAULT 0,
+                    failed_group_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ontology_curator_runs_started
+                ON ontology_curator_runs(started_at DESC, run_id DESC)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -540,3 +1021,74 @@ class SQLiteMemoryRegistry:
             ),
             last_error=row["last_error"],
         )
+
+    @staticmethod
+    def _row_to_ontology_observation_entry(row: sqlite3.Row) -> OntologyObservationEntry:
+        return OntologyObservationEntry(
+            observation_id=int(row["observation_id"]),
+            memory_id=row["memory_id"],
+            source_mode=row["source_mode"],
+            observation_kind=row["observation_kind"],
+            observed_label=row["observed_label"],
+            fallback_type=row["fallback_type"],
+            fit_level=row["fit_level"],
+            confidence=float(row["confidence"] or 0.5),
+            rationale=row["rationale"],
+            evidence=row["evidence"],
+            curated_status=row["curated_status"],
+            curated_run_id=(
+                int(row["curated_run_id"]) if row["curated_run_id"] is not None else None
+            ),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_ontology_alias_entry(row: sqlite3.Row) -> OntologyAliasEntry:
+        return OntologyAliasEntry(
+            alias_id=int(row["alias_id"]),
+            observation_kind=row["observation_kind"],
+            alias_label=row["alias_label"],
+            mapped_type=row["mapped_type"],
+            confidence=float(row["confidence"] or 0.5),
+            rationale=row["rationale"],
+            evidence_count=int(row["evidence_count"] or 0),
+            last_curated_run_id=(
+                int(row["last_curated_run_id"])
+                if row["last_curated_run_id"] is not None
+                else None
+            ),
+            status=row["status"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_ontology_curator_run_entry(row: sqlite3.Row) -> OntologyCuratorRunEntry:
+        return OntologyCuratorRunEntry(
+            run_id=int(row["run_id"]),
+            trigger=row["trigger"],
+            status=row["status"],
+            started_at=datetime.fromisoformat(row["started_at"]),
+            completed_at=(
+                datetime.fromisoformat(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+            scanned_observation_count=int(row["scanned_observation_count"] or 0),
+            grouped_candidate_count=int(row["grouped_candidate_count"] or 0),
+            alias_upserts=int(row["alias_upserts"] or 0),
+            deferred_group_count=int(row["deferred_group_count"] or 0),
+            proposed_new_group_count=int(row["proposed_new_group_count"] or 0),
+            failed_group_count=int(row["failed_group_count"] or 0),
+            last_error=row["last_error"],
+        )
+
+
+def _normalize_ontology_label(value: str | None) -> str:
+    if value is None:
+        return ""
+    normalized = "_".join(part for part in str(value).strip().lower().replace("-", "_").split())
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")

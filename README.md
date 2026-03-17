@@ -80,6 +80,7 @@ sequenceDiagram
     participant GW as Gateway / Agent
     participant CM as cosmic-memory
     participant X as xAI Extractor
+    participant OC as Ontology Curator
     participant A as Memory Adjudicator
     participant MD as Markdown Store
     participant REG as SQLite Registry
@@ -93,6 +94,7 @@ sequenceDiagram
     alt graph extraction enabled
         CM->>X: extract entities / relations / time anchors
         X-->>CM: graph_document
+        X-->>CM: weak-fit ontology observations
         CM->>MD: write normalized graph metadata
         CM->>CM: build episode provenance record
         CM->>A: adjudicate ambiguous entity merges
@@ -106,6 +108,7 @@ sequenceDiagram
     end
     CM->>Q: upsert passive memory point
     CM-->>GW: MemoryRecord + memory_id
+    Note over CM,OC: Scheduled ontology curator batches recurring weak-fit observations into learned aliases without mutating the hard ontology on the hot path.
 ```
 
 When `COSMIC_MEMORY_ASYNC_GRAPH_WRITES=true`, canonical markdown persistence, SQLite registry updates, and passive Qdrant sync stay on the request path, while graph extraction and graph-store ingest run through a durable background queue so slow xAI/Neo4j work does not block writes.
@@ -177,6 +180,7 @@ The current milestone in this repo provides:
 - write-time xAI graph extraction with structured output support,
 - internal xAI-backed entity adjudication for ambiguous graph writes,
 - internal xAI-backed fact adjudication for ambiguous active-fact invalidation,
+- soft ontology observation capture on write and a scheduled xAI curator loop for learned aliasing,
 - document-level graph dedup normalization before graph ingest,
 - a dedicated entity-similarity index for entity candidate generation and graph seeding,
 - first-class graph episodes for provenance and lineage,
@@ -323,6 +327,16 @@ Relevant environment variables:
 - `COSMIC_MEMORY_GRAPH_EXTRACT_MAX_RETRIES` (default `3`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_BASE_SECONDS` (default `1.0`)
 - `COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_ENABLED` (default `false`; enable explicitly when `XAI_API_KEY` is present and soft-ontology curation is desired)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MODEL` (default `grok-4-1-fast-reasoning`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_INTERVAL_SECONDS` (default disabled; set a positive interval such as `21600` for scheduled curation)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MIN_OBSERVATIONS` (default `3`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_GROUPS` (default `8`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_EXAMPLES_PER_GROUP` (default `4`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_PARALLEL` (default `1`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_RETRIES` (default `3`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_BASE_SECONDS` (default `1.0`)
+- `COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_MAX_SECONDS` (default `12.0`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED` (default `true` when `XAI_API_KEY` is present)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_MODEL` (default `grok-4-1-fast-reasoning`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_PARALLEL` (default `2`)
@@ -358,6 +372,9 @@ Graph notes:
 - weak alias keys do not auto-merge by themselves,
 - non-person entities such as `project`, `task`, and `organization` can auto-merge by exact normalized name,
 - ontology growth is intentionally conservative: new relation types should only be added when they come with deterministic normalization, compatibility rules, and strong duplicate suppression,
+- xAI is the primary ontology thinker, but live writes only emit weak-fit observations and learned aliases; hard ontology mutation stays out of the hot path,
+- the scheduled ontology curator can map recurring semantic labels such as `alma_mater` onto existing hard ontology types so future writes stop repeating the same weak-fit observations,
+- `propose_new` remains a soft signal for future ontology evolution, not an automatic live schema mutation,
 - entity similarity uses a separate Qdrant collection and the same Perplexity embedding model as passive memory,
 - vector similarity is only used for shortlist generation after exact identity and normalized-name checks,
 - ambiguous entity creation and merge decisions can be escalated to an internal xAI adjudicator,
@@ -423,6 +440,8 @@ Current server endpoints:
 | `GET` | `/v1/graph/status` | Report graph ingest, cache, and backend status. | Ops, Gateway health, maintenance jobs | Control-plane endpoint. |
 | `POST` | `/v1/graph/sync` | Incrementally repair persistent graph state from canonical records. | Ops, maintenance jobs | Supports optional LLM backfill and cache warming. |
 | `POST` | `/v1/graph/rebuild` | Rebuild the graph projection from canonical records. | Ops, maintenance jobs | Full graph rebuild path. |
+| `GET` | `/v1/ontology/status` | Report pending weak-fit observations, learned aliases, and last curator run. | Ops, diagnostics, maintenance jobs | Soft-ontology control plane. |
+| `POST` | `/v1/ontology/curate` | Run one manual ontology-curation pass over recurring weak-fit observations. | Ops, diagnostics, maintenance jobs | Uses xAI to learn aliases to existing ontology types. |
 
 Index behavior is aligned with the current Cosmic architecture:
 
@@ -436,6 +455,7 @@ Graph behavior follows the same pattern:
 
 - canonical Markdown stays authoritative,
 - graph episodes and relations are projections derived from canonical memories,
+- soft ontology aliases are also derived projections, stored in SQLite and fed back into future xAI extraction prompts,
 - ambiguous entity creation and fact invalidation stay inside `cosmic-memory`,
 - active-state graph queries prefer current facts and exclude invalidated facts by default.
 

@@ -35,6 +35,9 @@ from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     CoreFactBlock,
     EpisodeIngestResponse,
+    OntologyCurateRequest,
+    OntologyCurateResponse,
+    OntologyStatusResponse,
     GraphStatusResponse,
     GraphSyncRequest,
     GraphStoreStats,
@@ -657,6 +660,18 @@ class InMemoryDevelopmentMemoryService:
 
     async def rebuild_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse:
         return await self._sync_graph(mode="rebuild", request=request or GraphSyncRequest())
+
+    async def get_ontology_status(self) -> OntologyStatusResponse:
+        return OntologyStatusResponse(enabled=False)
+
+    async def curate_ontology(
+        self,
+        request: OntologyCurateRequest | None = None,
+    ) -> OntologyCurateResponse:
+        return OntologyCurateResponse(
+            enabled=False,
+            trigger="manual",
+        )
 
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest

@@ -7,10 +7,15 @@ from cosmic_memory.server.app import (
     _build_entity_index_from_env,
     _build_graph_adjudicator_from_env,
     _build_graph_extractor_from_env,
+    _build_ontology_curator_from_env,
     _build_graph_store_from_env,
     _graph_async_writes_enabled,
     _graph_warm_cache_on_startup_enabled,
     _graph_sync_on_startup_enabled,
+    _ontology_curator_interval_seconds,
+    _ontology_curator_max_examples_per_group,
+    _ontology_curator_max_groups,
+    _ontology_curator_min_observations,
     _graph_write_retry_base_seconds,
     _graph_write_retry_max_seconds,
     _graph_write_worker_poll_seconds,
@@ -155,6 +160,34 @@ def test_build_graph_extractor_can_construct_xai_backend(monkeypatch: pytest.Mon
     assert captured["primary_user_display_name"] == "Praveen"
 
 
+def test_build_ontology_curator_requires_xai_api_key_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_ENABLED", "true")
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError):
+        _build_ontology_curator_from_env()
+
+
+def test_build_ontology_curator_can_construct_xai_backend(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class FakeCurator:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_ENABLED", "true")
+    monkeypatch.setenv("XAI_API_KEY", "secret")
+    monkeypatch.setenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_MODEL", "grok-4-1-fast-reasoning")
+    monkeypatch.setattr("cosmic_memory.server.app.XAIOntologyCuratorService", FakeCurator)
+
+    _build_ontology_curator_from_env()
+
+    assert captured["api_key"] == "secret"
+    assert captured["model_name"] == "grok-4-1-fast-reasoning"
+
+
 def test_build_deterministic_graph_extractor_enabled_by_default(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED", raising=False)
     monkeypatch.setenv("COSMIC_MEMORY_PRIMARY_USER_DISPLAY_NAME", "Praveen")
@@ -222,6 +255,18 @@ def test_graph_write_tuning_env_defaults(monkeypatch: pytest.MonkeyPatch):
     assert _graph_write_worker_poll_seconds() == pytest.approx(0.5)
     assert _graph_write_retry_base_seconds() == pytest.approx(5.0)
     assert _graph_write_retry_max_seconds() == pytest.approx(300.0)
+
+
+def test_ontology_curator_tuning_env_defaults(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_MIN_OBSERVATIONS", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_GROUPS", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_EXAMPLES_PER_GROUP", raising=False)
+
+    assert _ontology_curator_interval_seconds() is None
+    assert _ontology_curator_min_observations() == 3
+    assert _ontology_curator_max_groups() == 8
+    assert _ontology_curator_max_examples_per_group() == 4
 
 
 def test_build_graph_adjudicator_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

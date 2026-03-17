@@ -13,6 +13,7 @@ from cosmic_memory.domain.models import (
     GraphSyncRequest,
     MemoryProvenance,
     MemoryRecord,
+    OntologyAliasItem,
     WriteMemoryRequest,
 )
 from cosmic_memory.extraction.models import (
@@ -864,6 +865,16 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
             client=FakeClient(),
             timezone_name="America/Chicago",
             primary_user_display_name="Praveen",
+            ontology_alias_provider=lambda: [
+                OntologyAliasItem(
+                    observation_kind="relation_type",
+                    alias_label="alma_mater",
+                    mapped_type="graduated_from",
+                    confidence=0.93,
+                    rationale="education wording aligns with graduated_from",
+                    evidence_count=4,
+                )
+            ],
         )
         result = await extractor.extract(
             MemoryRecord(
@@ -888,5 +899,9 @@ def test_xai_graph_extractor_builds_time_aware_prompt_and_parses_schema(monkeypa
         assert "Today Cosmic Memory is blocked by embedding latency." in user_message
         assert "graduated_from" in user_message
         assert "attended" in user_message
+        assert "Learned semantic alias hints:" in user_message
+        assert "alma_mater" in user_message
+        assert "ontology_observations" in system_message
+        assert "If learned semantic alias hints map a recurring concept" in system_message
 
     asyncio.run(run())

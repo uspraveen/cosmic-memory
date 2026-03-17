@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cosmic_memory.domain.models import OntologyAliasItem
 from cosmic_memory.domain.models import MemoryRecord
 from cosmic_memory.extraction.models import GraphExtractionResult
 from cosmic_memory.graph.ontology import EntityType, RelationType
@@ -33,6 +35,11 @@ Rules:
 - Use graduated_from for grounded graduation or degree-completion facts tied to an institution.
 - Do not use part_of for education facts when attended or graduated_from is a better fit.
 - Only emit both attended and graduated_from when the memory explicitly supports both as distinct facts. If the memory only says someone graduated, prefer graduated_from alone.
+- If learned semantic alias hints map a recurring concept to an allowed ontology type, use that mapped_type directly instead of falling back to a generic relation.
+- If a concept is only a weak or poor fit for the current ontology, still choose the best existing type for the actual extraction result, and add an ontology_observation describing the weak fit.
+- ontology_observations are for recurring semantic patterns, not one-off proper nouns.
+- In ontology_observations, observed_label should be short, reusable, and lowercase or snake_case.
+- Do not emit ontology_observations for concepts that are already a good fit or covered by learned alias hints.
 - If time is implied but not precise, prefer null over guessing.
 - valid_at means when a fact becomes true.
 - invalid_at means when a fact stops being true.
@@ -56,6 +63,7 @@ class XAIGraphExtractionService:
         max_retries: int = 3,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 12.0,
+        ontology_alias_provider: Callable[[], Sequence[OntologyAliasItem]] | None = None,
         client=None,
     ) -> None:
         self.model_name = model_name
@@ -64,6 +72,7 @@ class XAIGraphExtractionService:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
+        self._ontology_alias_provider = ontology_alias_provider
         self._semaphore = asyncio.Semaphore(max(1, max_parallel_requests))
         self._owns_client = client is None
         self._client = client or self._build_client(api_key)
@@ -94,6 +103,12 @@ class XAIGraphExtractionService:
         if callable(close):
             await asyncio.to_thread(close)
 
+    def set_ontology_alias_provider(
+        self,
+        provider: Callable[[], Sequence[OntologyAliasItem]] | None,
+    ) -> None:
+        self._ontology_alias_provider = provider
+
     def _extract_once(self, record: MemoryRecord) -> GraphExtractionResult:
         from xai_sdk.chat import system, user
 
@@ -108,6 +123,7 @@ class XAIGraphExtractionService:
                     record,
                     timezone_name=self.timezone_name,
                     primary_user_display_name=self.primary_user_display_name,
+                    learned_aliases=list(self._load_ontology_aliases()),
                 )
             )
         )
@@ -135,12 +151,22 @@ class XAIGraphExtractionService:
             raise ValueError("XAI_API_KEY is required for xAI graph extraction.")
         return Client(api_key=resolved_api_key)
 
+    def _load_ontology_aliases(self) -> Sequence[OntologyAliasItem]:
+        if self._ontology_alias_provider is None:
+            return ()
+        try:
+            aliases = self._ontology_alias_provider()
+        except Exception:
+            return ()
+        return aliases or ()
+
 
 def _build_user_prompt(
     record: MemoryRecord,
     *,
     timezone_name: str,
     primary_user_display_name: str | None = None,
+    learned_aliases: Sequence[OntologyAliasItem] = (),
 ) -> str:
     local_now = _local_now(timezone_name)
     utc_now = datetime.now(timezone.utc)
@@ -152,6 +178,7 @@ def _build_user_prompt(
         "entity_types": [entity_type.value for entity_type in EntityType],
         "relation_types": [relation_type.value for relation_type in RelationType],
     }
+    alias_hints = [alias.model_dump(mode="json") for alias in learned_aliases]
     return f"""Extract graph memory from this canonical Cosmic memory.
 
 Time anchors:
@@ -170,6 +197,9 @@ Memory metadata:
 
 Ontology:
 {ontology}
+
+Learned semantic alias hints:
+{alias_hints}
 
 Memory content:
 \"\"\"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -58,6 +58,39 @@ class ExtractedGraphRelation(BaseModel):
     )
 
 
+class OntologyObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_kind: Literal["entity_type", "relation_type"] = Field(
+        description="Which ontology surface felt like a weak fit."
+    )
+    observed_label: str = Field(
+        description="Short semantic label for the concept, such as internship_project or alma_mater."
+    )
+    fallback_type: str | None = Field(
+        default=None,
+        description="Best existing ontology type used for the actual extraction result.",
+    )
+    fit_level: Literal["good", "weak", "poor"] = Field(
+        default="weak",
+        description="How well the current ontology fit the concept.",
+    )
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that this observation is worth future ontology guidance.",
+    )
+    rationale: str | None = Field(
+        default=None,
+        description="Short grounded reason for why the concept was a weak fit.",
+    )
+    evidence: str | None = Field(
+        default=None,
+        description="Short grounded text span or fact illustrating the concept.",
+    )
+
+
 class GraphExtractionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,4 +109,8 @@ class GraphExtractionResult(BaseModel):
     relations: list[ExtractedGraphRelation] = Field(
         default_factory=list,
         description="Typed relations grounded in the source memory.",
+    )
+    ontology_observations: list[OntologyObservation] = Field(
+        default_factory=list,
+        description="Optional weak-fit ontology observations for later curator passes.",
     )

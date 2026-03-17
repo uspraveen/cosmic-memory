@@ -6,6 +6,7 @@ from cosmic_memory.extraction.models import (
     ExtractedGraphEntity,
     ExtractedGraphRelation,
     GraphExtractionResult,
+    OntologyObservation,
 )
 from cosmic_memory.extraction.normalize import (
     GraphDocumentNormalizationReport,
@@ -21,6 +22,7 @@ __all__ = [
     "GraphDocumentNormalizationReport",
     "GraphExtractionResult",
     "GraphExtractionService",
+    "OntologyObservation",
     "XAIGraphExtractionService",
     "normalize_extraction_result",
     "normalize_graph_document",

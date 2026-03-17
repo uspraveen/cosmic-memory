@@ -300,6 +300,61 @@ class GraphSyncResponse(BaseModel):
     status: GraphStatusResponse
 
 
+class OntologyAliasItem(BaseModel):
+    observation_kind: Literal["entity_type", "relation_type"]
+    alias_label: str
+    mapped_type: str
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    rationale: str | None = None
+    evidence_count: int = 0
+    updated_at: datetime | None = None
+
+
+class OntologyStatusResponse(BaseModel):
+    enabled: bool
+    model_name: str | None = None
+    interval_seconds: float | None = None
+    pending_observation_count: int = 0
+    deferred_observation_count: int = 0
+    proposed_new_observation_count: int = 0
+    active_alias_count: int = 0
+    last_run_status: str | None = None
+    last_run_started_at: datetime | None = None
+    last_run_completed_at: datetime | None = None
+    last_run_alias_upserts: int = 0
+    last_run_failed_group_count: int = 0
+    aliases: list[OntologyAliasItem] = Field(default_factory=list)
+
+
+class OntologyCurateRequest(BaseModel):
+    max_groups: int | None = Field(default=None, ge=1, le=64)
+    min_observations: int | None = Field(default=None, ge=1, le=50)
+    max_examples_per_group: int | None = Field(default=None, ge=1, le=12)
+
+
+class OntologyCurateDecisionItem(BaseModel):
+    observation_kind: Literal["entity_type", "relation_type"]
+    alias_label: str
+    decision: Literal["map_to_existing", "keep_observing", "propose_new"]
+    mapped_type: str | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    rationale: str | None = None
+    observation_count: int = 0
+
+
+class OntologyCurateResponse(BaseModel):
+    enabled: bool
+    run_id: int | None = None
+    trigger: Literal["manual", "scheduled"]
+    scanned_observation_count: int = 0
+    grouped_candidate_count: int = 0
+    alias_upserts: int = 0
+    deferred_group_count: int = 0
+    proposed_new_group_count: int = 0
+    failed_group_count: int = 0
+    decisions: list[OntologyCurateDecisionItem] = Field(default_factory=list)
+
+
 class GraphEntity(BaseModel):
     entity_id: str
     name: str
@@ -392,3 +447,9 @@ class HealthStatus(BaseModel):
     graph_queue_pending_count: int = 0
     graph_queue_running_count: int = 0
     graph_queue_failed_count: int = 0
+    ontology_curator_enabled: bool = False
+    ontology_pending_observation_count: int = 0
+    ontology_deferred_observation_count: int = 0
+    ontology_proposed_new_count: int = 0
+    ontology_alias_count: int = 0
+    ontology_last_run_status: str | None = None

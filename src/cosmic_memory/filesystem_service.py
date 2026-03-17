@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from time import perf_counter
@@ -39,15 +40,20 @@ from cosmic_memory.domain.models import (
     CanonicalMemorySnapshot,
     CoreFactBlock,
     EpisodeIngestResponse,
-    GraphStatusResponse,
     GraphSyncRequest,
-    GraphStoreStats,
+    GraphStatusResponse,
     GraphSyncResponse,
+    GraphStoreStats,
     HealthStatus,
     IngestEpisodeRequest,
     IndexStatusResponse,
     IndexSyncResponse,
     MemoryRecord,
+    OntologyAliasItem,
+    OntologyCurateDecisionItem,
+    OntologyCurateRequest,
+    OntologyCurateResponse,
+    OntologyStatusResponse,
     PassiveRecallDiagnostics,
     PassiveRecallRequest,
     PassiveRecallResponse,
@@ -61,6 +67,7 @@ from cosmic_memory.episode_ingestion import (
     build_episode_write_request,
 )
 from cosmic_memory.extraction.base import GraphExtractionService
+from cosmic_memory.extraction.models import OntologyObservation
 from cosmic_memory.graph import (
     GraphStore,
     build_query_frame,
@@ -68,6 +75,10 @@ from cosmic_memory.graph import (
     should_extract_graph_for_record,
 )
 from cosmic_memory.index.base import PassiveMemoryIndex
+from cosmic_memory.ontology_curator import (
+    OntologyCuratorService,
+    OntologyObservationGroup,
+)
 from cosmic_memory.retrieval import (
     apply_graph_recipe_for_mode,
     build_active_response,
@@ -94,12 +105,17 @@ class FilesystemMemoryService:
         graph_store: GraphStore | None = None,
         graph_extractor: GraphExtractionService | None = None,
         graph_llm_extractor: GraphExtractionService | None = None,
+        ontology_curator: OntologyCuratorService | None = None,
         index_sync_batch_size: int = 128,
         passive_graph_timeout_seconds: float = 0.12,
         async_graph_writes: bool = False,
         graph_write_worker_poll_seconds: float = 0.5,
         graph_write_retry_base_seconds: float = 5.0,
         graph_write_retry_max_seconds: float = 300.0,
+        ontology_curator_interval_seconds: float | None = None,
+        ontology_curator_min_observations: int = 3,
+        ontology_curator_max_groups: int = 8,
+        ontology_curator_max_examples_per_group: int = 4,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +125,7 @@ class FilesystemMemoryService:
         self.graph_store = graph_store
         self.graph_extractor = graph_extractor
         self.graph_llm_extractor = graph_llm_extractor
+        self.ontology_curator = ontology_curator
         self.index_sync_batch_size = index_sync_batch_size
         self.passive_graph_timeout_seconds = passive_graph_timeout_seconds
         self.async_graph_writes = async_graph_writes
@@ -122,12 +139,28 @@ class FilesystemMemoryService:
         self._graph_write_shutdown = asyncio.Event()
         self._graph_write_task: asyncio.Task | None = None
         self._graph_operation_lock = asyncio.Lock()
+        self.ontology_curator_interval_seconds = (
+            None
+            if ontology_curator_interval_seconds is None or ontology_curator_interval_seconds <= 0
+            else max(0.1, ontology_curator_interval_seconds)
+        )
+        self.ontology_curator_min_observations = max(1, ontology_curator_min_observations)
+        self.ontology_curator_max_groups = max(1, ontology_curator_max_groups)
+        self.ontology_curator_max_examples_per_group = max(1, ontology_curator_max_examples_per_group)
+        self._ontology_curator_shutdown = asyncio.Event()
+        self._ontology_curator_task: asyncio.Task | None = None
+        self._ontology_curator_lock = asyncio.Lock()
+        alias_provider = getattr(self.graph_llm_extractor, "set_ontology_alias_provider", None)
+        if callable(alias_provider):
+            alias_provider(self._list_active_ontology_alias_items)
 
     async def health(self) -> HealthStatus:
         if self.passive_index is not None:
             await self.passive_index.ensure_ready()
         stats = await self._graph_store_stats()
         queue_counts = self.registry.graph_sync_queue_counts()
+        ontology_counts = self.registry.ontology_observation_counts()
+        last_ontology_run = self.registry.latest_ontology_curator_run()
         return HealthStatus(
             ok=True,
             mode="filesystem_canonical",
@@ -149,34 +182,53 @@ class FilesystemMemoryService:
             graph_queue_pending_count=queue_counts.get("pending", 0),
             graph_queue_running_count=queue_counts.get("running", 0),
             graph_queue_failed_count=queue_counts.get("failed", 0),
+            ontology_curator_enabled=self.ontology_curator is not None,
+            ontology_pending_observation_count=ontology_counts.get("pending", 0),
+            ontology_deferred_observation_count=ontology_counts.get("deferred", 0),
+            ontology_proposed_new_count=ontology_counts.get("proposed_new", 0),
+            ontology_alias_count=self.registry.active_ontology_alias_count(),
+            ontology_last_run_status=(
+                last_ontology_run.status if last_ontology_run is not None else None
+            ),
         )
 
     async def start_background_tasks(self) -> None:
-        if not self._graph_writes_enabled():
-            return
-        requeued = self.registry.requeue_running_graph_sync_jobs()
-        if requeued:
-            logger.warning("memory.graph_write_jobs_requeued count=%s", requeued)
-        self._graph_write_shutdown.clear()
-        self._graph_write_event.set()
-        if self._graph_write_task is not None and not self._graph_write_task.done():
-            return
-        self._graph_write_task = asyncio.create_task(
-            self._graph_write_worker(),
-            name="cosmic-memory-graph-write-worker",
-        )
+        if self._graph_writes_enabled():
+            requeued = self.registry.requeue_running_graph_sync_jobs()
+            if requeued:
+                logger.warning("memory.graph_write_jobs_requeued count=%s", requeued)
+            self._graph_write_shutdown.clear()
+            self._graph_write_event.set()
+            if self._graph_write_task is None or self._graph_write_task.done():
+                self._graph_write_task = asyncio.create_task(
+                    self._graph_write_worker(),
+                    name="cosmic-memory-graph-write-worker",
+                )
+        if self._scheduled_ontology_curation_enabled():
+            self._ontology_curator_shutdown.clear()
+            if self._ontology_curator_task is None or self._ontology_curator_task.done():
+                self._ontology_curator_task = asyncio.create_task(
+                    self._ontology_curator_worker(),
+                    name="cosmic-memory-ontology-curator-worker",
+                )
 
     async def stop_background_tasks(self) -> None:
         self._graph_write_shutdown.set()
         self._graph_write_event.set()
-        if self._graph_write_task is None:
-            return
-        self._graph_write_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._graph_write_task
-        self._graph_write_task = None
+        if self._graph_write_task is not None:
+            self._graph_write_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._graph_write_task
+            self._graph_write_task = None
         self._graph_write_event.clear()
         self._graph_write_shutdown.clear()
+        self._ontology_curator_shutdown.set()
+        if self._ontology_curator_task is not None:
+            self._ontology_curator_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._ontology_curator_task
+            self._ontology_curator_task = None
+        self._ontology_curator_shutdown.clear()
 
     async def wait_for_graph_queue_idle(self, *, timeout_seconds: float = 10.0) -> dict[str, int]:
         deadline = asyncio.get_running_loop().time() + max(0.1, timeout_seconds)
@@ -770,6 +822,53 @@ class FilesystemMemoryService:
         async with self._graph_operation_lock:
             return await self._sync_graph(mode="rebuild", request=request or GraphSyncRequest())
 
+    async def get_ontology_status(self) -> OntologyStatusResponse:
+        counts = self.registry.ontology_observation_counts()
+        last_run = self.registry.latest_ontology_curator_run()
+        aliases = [
+            OntologyAliasItem(
+                observation_kind=entry.observation_kind,
+                alias_label=entry.alias_label,
+                mapped_type=entry.mapped_type,
+                confidence=entry.confidence,
+                rationale=entry.rationale,
+                evidence_count=entry.evidence_count,
+                updated_at=entry.updated_at,
+            )
+            for entry in self.registry.list_active_ontology_aliases(limit=32)
+        ]
+        return OntologyStatusResponse(
+            enabled=self.ontology_curator is not None,
+            model_name=getattr(self.ontology_curator, "model_name", None),
+            interval_seconds=self.ontology_curator_interval_seconds,
+            pending_observation_count=counts.get("pending", 0),
+            deferred_observation_count=counts.get("deferred", 0),
+            proposed_new_observation_count=counts.get("proposed_new", 0),
+            active_alias_count=self.registry.active_ontology_alias_count(),
+            last_run_status=last_run.status if last_run is not None else None,
+            last_run_started_at=last_run.started_at if last_run is not None else None,
+            last_run_completed_at=last_run.completed_at if last_run is not None else None,
+            last_run_alias_upserts=last_run.alias_upserts if last_run is not None else 0,
+            last_run_failed_group_count=(
+                last_run.failed_group_count if last_run is not None else 0
+            ),
+            aliases=aliases,
+        )
+
+    async def curate_ontology(
+        self,
+        request: OntologyCurateRequest | None = None,
+        *,
+        trigger: str = "manual",
+    ) -> OntologyCurateResponse:
+        if self.ontology_curator is None:
+            return OntologyCurateResponse(enabled=False, trigger=trigger)
+        async with self._ontology_curator_lock:
+            return await self._curate_ontology_locked(
+                request=request or OntologyCurateRequest(),
+                trigger=trigger,
+            )
+
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest
     ) -> MemoryRecord | None:
@@ -844,6 +943,7 @@ class FilesystemMemoryService:
         if sync_passive_index and self.passive_index is not None:
             await self.passive_index.ensure_ready()
             await self.passive_index.sync_record(snapshot)
+        self._sync_ontology_observations(record)
         return snapshot
 
     def _load_records(
@@ -1215,6 +1315,232 @@ class FilesystemMemoryService:
         self._graph_write_event.set()
         return job
 
+    def _scheduled_ontology_curation_enabled(self) -> bool:
+        return self.ontology_curator is not None and self.ontology_curator_interval_seconds is not None
+
+    async def _ontology_curator_worker(self) -> None:
+        interval_seconds = self.ontology_curator_interval_seconds
+        if interval_seconds is None:
+            return
+        logger.info(
+            "memory.ontology_curator_worker_started interval_seconds=%s",
+            interval_seconds,
+        )
+        try:
+            while not self._ontology_curator_shutdown.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._ontology_curator_shutdown.wait(),
+                        timeout=interval_seconds,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                if self._ontology_curator_shutdown.is_set():
+                    break
+                try:
+                    response = await self.curate_ontology(trigger="scheduled")
+                    logger.info(
+                        "memory.ontology_curator_cycle_complete run_id=%s scanned=%s grouped=%s alias_upserts=%s deferred=%s proposed_new=%s failed=%s",
+                        response.run_id,
+                        response.scanned_observation_count,
+                        response.grouped_candidate_count,
+                        response.alias_upserts,
+                        response.deferred_group_count,
+                        response.proposed_new_group_count,
+                        response.failed_group_count,
+                    )
+                except Exception:
+                    logger.exception("memory.ontology_curator_cycle_failed")
+        except asyncio.CancelledError:
+            logger.info("memory.ontology_curator_worker_cancelled")
+            raise
+        finally:
+            logger.info("memory.ontology_curator_worker_stopped")
+
+    async def _curate_ontology_locked(
+        self,
+        *,
+        request: OntologyCurateRequest,
+        trigger: str,
+    ) -> OntologyCurateResponse:
+        observations = self.registry.list_pending_ontology_observations(
+            statuses=["pending", "deferred"]
+        )
+        if not observations:
+            return OntologyCurateResponse(
+                enabled=True,
+                trigger=trigger,
+            )
+        run = self.registry.begin_ontology_curator_run(trigger=trigger)
+        grouped_entries = self._build_ontology_observation_groups(
+            observations,
+            max_examples_per_group=(
+                request.max_examples_per_group or self.ontology_curator_max_examples_per_group
+            ),
+        )
+        grouped_entries.sort(
+            key=lambda item: (
+                -item[0].observation_count,
+                -item[0].fit_counts.get("poor", 0),
+                -item[0].fit_counts.get("weak", 0),
+                item[0].alias_label,
+            )
+        )
+        max_groups = request.max_groups or self.ontology_curator_max_groups
+        min_observations = request.min_observations or self.ontology_curator_min_observations
+        selected_groups = grouped_entries[:max_groups]
+        alias_upserts = 0
+        deferred_group_count = 0
+        proposed_new_group_count = 0
+        failed_group_count = 0
+        decisions: list[OntologyCurateDecisionItem] = []
+
+        for group, observation_ids in selected_groups:
+            try:
+                if group.observation_count < min_observations:
+                    decision = None
+                    self.registry.mark_ontology_observations_status(
+                        observation_ids,
+                        status="deferred",
+                        curated_run_id=run.run_id,
+                    )
+                    deferred_group_count += 1
+                    decisions.append(
+                        OntologyCurateDecisionItem(
+                            observation_kind=group.observation_kind,
+                            alias_label=group.alias_label,
+                            decision="keep_observing",
+                            confidence=0.0,
+                            rationale=(
+                                f"Need more recurrence before curation "
+                                f"({group.observation_count}/{min_observations})."
+                            ),
+                            observation_count=group.observation_count,
+                        )
+                    )
+                    logger.info(
+                        "memory.ontology_curator_group_deferred alias_label=%s observation_kind=%s observation_count=%s reason=below_threshold",
+                        group.alias_label,
+                        group.observation_kind,
+                        group.observation_count,
+                    )
+                else:
+                    learned_aliases = self._list_active_ontology_alias_items()
+                    decision = await self.ontology_curator.curate_group(
+                        group,
+                        learned_aliases=learned_aliases,
+                    )
+                    if decision.decision == "map_to_existing" and decision.mapped_type:
+                        self.registry.upsert_ontology_alias(
+                            observation_kind=group.observation_kind,
+                            alias_label=group.alias_label,
+                            mapped_type=decision.mapped_type,
+                            confidence=decision.confidence,
+                            rationale=decision.rationale,
+                            evidence_count=group.observation_count,
+                            curated_run_id=run.run_id,
+                        )
+                        self.registry.mark_ontology_observations_status(
+                            observation_ids,
+                            status="aliased",
+                            curated_run_id=run.run_id,
+                        )
+                        alias_upserts += 1
+                        logger.info(
+                            "memory.ontology_curator_alias_upsert alias_label=%s observation_kind=%s mapped_type=%s confidence=%s observation_count=%s",
+                            group.alias_label,
+                            group.observation_kind,
+                            decision.mapped_type,
+                            round(decision.confidence, 3),
+                            group.observation_count,
+                        )
+                    elif decision.decision == "propose_new":
+                        self.registry.mark_ontology_observations_status(
+                            observation_ids,
+                            status="proposed_new",
+                            curated_run_id=run.run_id,
+                        )
+                        proposed_new_group_count += 1
+                        logger.info(
+                            "memory.ontology_curator_group_proposed_new alias_label=%s observation_kind=%s observation_count=%s",
+                            group.alias_label,
+                            group.observation_kind,
+                            group.observation_count,
+                        )
+                    else:
+                        self.registry.mark_ontology_observations_status(
+                            observation_ids,
+                            status="deferred",
+                            curated_run_id=run.run_id,
+                        )
+                        deferred_group_count += 1
+                        logger.info(
+                            "memory.ontology_curator_group_deferred alias_label=%s observation_kind=%s observation_count=%s reason=llm_keep_observing",
+                            group.alias_label,
+                            group.observation_kind,
+                            group.observation_count,
+                        )
+                    decisions.append(
+                        OntologyCurateDecisionItem(
+                            observation_kind=group.observation_kind,
+                            alias_label=group.alias_label,
+                            decision=decision.decision,
+                            mapped_type=decision.mapped_type,
+                            confidence=decision.confidence,
+                            rationale=decision.rationale,
+                            observation_count=group.observation_count,
+                        )
+                    )
+            except Exception:
+                failed_group_count += 1
+                logger.exception(
+                    "memory.ontology_curator_group_failed alias_label=%s observation_kind=%s run_id=%s",
+                    group.alias_label,
+                    group.observation_kind,
+                    run.run_id,
+                )
+
+        run_status = "succeeded" if failed_group_count == 0 else "partial_failure"
+        self.registry.complete_ontology_curator_run(
+            run_id=run.run_id,
+            status=run_status,
+            scanned_observation_count=len(observations),
+            grouped_candidate_count=len(selected_groups),
+            alias_upserts=alias_upserts,
+            deferred_group_count=deferred_group_count,
+            proposed_new_group_count=proposed_new_group_count,
+            failed_group_count=failed_group_count,
+            last_error=(
+                None
+                if failed_group_count == 0
+                else f"{failed_group_count} ontology group(s) failed during curation."
+            ),
+        )
+        logger.info(
+            "memory.ontology_curator_run_complete run_id=%s trigger=%s scanned=%s grouped=%s alias_upserts=%s deferred=%s proposed_new=%s failed=%s",
+            run.run_id,
+            trigger,
+            len(observations),
+            len(selected_groups),
+            alias_upserts,
+            deferred_group_count,
+            proposed_new_group_count,
+            failed_group_count,
+        )
+        return OntologyCurateResponse(
+            enabled=True,
+            run_id=run.run_id,
+            trigger=trigger,
+            scanned_observation_count=len(observations),
+            grouped_candidate_count=len(selected_groups),
+            alias_upserts=alias_upserts,
+            deferred_group_count=deferred_group_count,
+            proposed_new_group_count=proposed_new_group_count,
+            failed_group_count=failed_group_count,
+            decisions=decisions,
+        )
+
     async def _graph_write_worker(self) -> None:
         logger.info("memory.graph_write_worker_started")
         try:
@@ -1351,6 +1677,7 @@ class FilesystemMemoryService:
             allow_llm=allow_llm,
         )
         if document is None:
+            self._sync_ontology_observations(record)
             logger.info(
                 "memory.graph_ingest_skipped memory_id=%s kind=%s",
                 record.memory_id,
@@ -1366,6 +1693,8 @@ class FilesystemMemoryService:
                 record.memory_id,
                 record.kind.value,
             )
+        else:
+            self._sync_ontology_observations(record)
         result = await self.graph_store.ingest_document(document)
         logger.info(
             "memory.graph_ingested memory_id=%s episode_id=%s entities=%s relations=%s invalidated=%s",
@@ -1430,6 +1759,93 @@ class FilesystemMemoryService:
             )
         except Exception:
             logger.exception("Graph extraction failed for memory %s", record.memory_id)
+
+    def _sync_ontology_observations(self, record: MemoryRecord) -> int:
+        extraction_meta = record.metadata.get("graph_extraction") or {}
+        source_mode = str(extraction_meta.get("mode") or "none")
+        raw_observations = extraction_meta.get("ontology_observations") or []
+        observations: list[OntologyObservation] = []
+        for item in raw_observations:
+            try:
+                observations.append(OntologyObservation.model_validate(item))
+            except Exception:
+                logger.warning(
+                    "memory.ontology_observation_invalid memory_id=%s source_mode=%s",
+                    record.memory_id,
+                    source_mode,
+                )
+        inserted = self.registry.replace_ontology_observations(
+            memory_id=record.memory_id,
+            source_mode=source_mode,
+            observations=observations,
+        )
+        logger.info(
+            "memory.ontology_observations_replaced memory_id=%s source_mode=%s inserted=%s",
+            record.memory_id,
+            source_mode,
+            inserted,
+        )
+        return inserted
+
+    def _list_active_ontology_alias_items(self) -> list[OntologyAliasItem]:
+        return [
+            OntologyAliasItem(
+                observation_kind=entry.observation_kind,
+                alias_label=entry.alias_label,
+                mapped_type=entry.mapped_type,
+                confidence=entry.confidence,
+                rationale=entry.rationale,
+                evidence_count=entry.evidence_count,
+                updated_at=entry.updated_at,
+            )
+            for entry in self.registry.list_active_ontology_aliases(limit=256)
+        ]
+
+    @staticmethod
+    def _build_ontology_observation_groups(
+        observations,
+        *,
+        max_examples_per_group: int,
+    ) -> list[tuple[OntologyObservationGroup, list[int]]]:
+        grouped: dict[tuple[str, str], dict[str, object]] = {}
+        for observation in observations:
+            key = (observation.observation_kind, observation.observed_label)
+            bucket = grouped.setdefault(
+                key,
+                {
+                    "ids": [],
+                    "fit_counts": Counter(),
+                    "fallback_type_counts": Counter(),
+                    "example_evidence": [],
+                    "example_rationales": [],
+                    "example_memory_ids": [],
+                },
+            )
+            bucket["ids"].append(observation.observation_id)
+            bucket["fit_counts"][observation.fit_level] += 1
+            if observation.fallback_type:
+                bucket["fallback_type_counts"][observation.fallback_type] += 1
+            if observation.evidence and len(bucket["example_evidence"]) < max_examples_per_group:
+                bucket["example_evidence"].append(observation.evidence)
+            if observation.rationale and len(bucket["example_rationales"]) < max_examples_per_group:
+                bucket["example_rationales"].append(observation.rationale)
+            if len(bucket["example_memory_ids"]) < max_examples_per_group:
+                bucket["example_memory_ids"].append(observation.memory_id)
+
+        grouped_items: list[tuple[OntologyObservationGroup, list[int]]] = []
+        for (observation_kind, alias_label), bucket in grouped.items():
+            group = OntologyObservationGroup(
+                observation_kind=observation_kind,
+                alias_label=alias_label,
+                observation_count=len(bucket["ids"]),
+                fit_counts=dict(bucket["fit_counts"]),
+                fallback_type_counts=dict(bucket["fallback_type_counts"]),
+                example_evidence=list(bucket["example_evidence"]),
+                example_rationales=list(bucket["example_rationales"]),
+                example_memory_ids=list(bucket["example_memory_ids"]),
+            )
+            grouped_items.append((group, list(bucket["ids"])))
+        return grouped_items
 
     @staticmethod
     def _finalize_passive_response(

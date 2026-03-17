@@ -76,6 +76,10 @@ async def ensure_graph_document_for_record(
                 "dropped_relation_count": report.dropped_relation_count,
                 "rewritten_relation_count": report.rewritten_relation_count,
                 "rationale": extraction_result.rationale,
+                "ontology_observations": [
+                    observation.model_dump(mode="json")
+                    for observation in extraction_result.ontology_observations
+                ],
             }
             if document is not None:
                 document.episode = _coerce_episode_for_record(record, document)
@@ -114,6 +118,10 @@ async def ensure_graph_document_for_record(
         "dropped_relation_count": report.dropped_relation_count,
         "rewritten_relation_count": report.rewritten_relation_count,
         "rationale": extraction_result.rationale,
+        "ontology_observations": [
+            observation.model_dump(mode="json")
+            for observation in extraction_result.ontology_observations
+        ],
     }
     if document is not None:
         document.episode = _coerce_episode_for_record(record, document)
