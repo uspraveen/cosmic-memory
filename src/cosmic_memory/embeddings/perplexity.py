@@ -19,6 +19,11 @@ from cosmic_memory.domain.models import (
     GenerateEmbeddingsRequest,
     GenerateEmbeddingsResponse,
 )
+from cosmic_memory.usage import (
+    GatewayUsageLogger,
+    begin_metered_call,
+    extract_provider_request_id,
+)
 
 
 @dataclass(slots=True)
@@ -44,6 +49,7 @@ class PerplexityStandardEmbeddingService:
         max_retries: int = 4,
         retry_base_seconds: float = 0.75,
         retry_max_seconds: float = 8.0,
+        usage_logger: GatewayUsageLogger | None = None,
         client: Any | None = None,
     ) -> None:
         self.model_name = model_name
@@ -56,6 +62,7 @@ class PerplexityStandardEmbeddingService:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
+        self._usage_logger = usage_logger
         self._owns_client = client is None
         self._client = client or self._build_client(api_key)
 
@@ -125,7 +132,16 @@ class PerplexityStandardEmbeddingService:
             if self.timeout is not None:
                 kwargs["timeout"] = self.timeout
 
-            response = await self._create_with_retry(**kwargs)
+            response = await self._create_with_retry(
+                usage_metadata={
+                    "text_count": len(texts),
+                    "dimensions": dimensions,
+                    "encoding_format": encoding_format,
+                    "normalize": normalize,
+                    "batch_offset": offset,
+                },
+                **kwargs,
+            )
 
         items: list[EmbeddingItem] = []
         for position, entry in enumerate(response.data or []):
@@ -153,12 +169,34 @@ class PerplexityStandardEmbeddingService:
             usage=_parse_usage(getattr(response, "usage", None)),
         )
 
-    async def _create_with_retry(self, **kwargs):
+    async def _create_with_retry(self, *, usage_metadata: dict[str, Any] | None = None, **kwargs):
         attempt = 0
         while True:
+            metered_call = begin_metered_call(prefix="call")
             try:
-                return await self._client.embeddings.create(**kwargs)
+                response = await self._client.embeddings.create(**kwargs)
+                await self._emit_usage(
+                    metered_call=metered_call,
+                    response=response,
+                    success=True,
+                    error_code=None,
+                    metadata_json={
+                        **(usage_metadata or {}),
+                        "attempt": attempt + 1,
+                    },
+                )
+                return response
             except Exception as exc:
+                await self._emit_usage(
+                    metered_call=metered_call,
+                    response=None,
+                    success=False,
+                    error_code=type(exc).__name__,
+                    metadata_json={
+                        **(usage_metadata or {}),
+                        "attempt": attempt + 1,
+                    },
+                )
                 if attempt >= self.max_retries or not _is_retryable_error(exc):
                     raise
                 delay = min(
@@ -184,6 +222,33 @@ class PerplexityStandardEmbeddingService:
         if not resolved_api_key:
             raise ValueError("PERPLEXITY_API_KEY is required for Perplexity embeddings.")
         return AsyncPerplexity(api_key=resolved_api_key)
+
+    async def _emit_usage(
+        self,
+        *,
+        metered_call,
+        response: Any,
+        success: bool,
+        error_code: str | None,
+        metadata_json: dict[str, Any] | None,
+    ) -> None:
+        if self._usage_logger is None:
+            return
+        try:
+            await self._usage_logger.emit(
+                metered_call=metered_call,
+                provider="perplexity",
+                model=self.model_name,
+                usage_kind="embedding",
+                operation="memory.embed",
+                raw_usage=getattr(response, "usage", None),
+                provider_request_id=extract_provider_request_id(response),
+                success=success,
+                error_code=error_code,
+                metadata_json=metadata_json,
+            )
+        except Exception:
+            return
 
 
 def _chunked_with_offsets(texts: Sequence[str], batch_size: int) -> list[tuple[int, list[str]]]:

@@ -43,6 +43,7 @@ from cosmic_memory.graph.entity_qdrant import QdrantEntitySimilarityIndex
 from cosmic_memory.index import FastEmbedSparseEncoder, QdrantHybridMemoryIndex, SimpleSparseEncoder
 from cosmic_memory.ontology_curator import XAIOntologyCuratorService
 from cosmic_memory.service import MemoryService
+from cosmic_memory.usage import GatewayUsageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ def create_app(
         await _close_if_present(ontology_curator)
         graph_store = getattr(getattr(app.state, "memory_service", None), "graph_store", None)
         await _close_if_present(graph_store)
+        await _close_if_present(getattr(app.state, "usage_logger", None))
 
     app = FastAPI(title="cosmic-memory", version="0.1.0", lifespan=lifespan)
     app.state.memory_service = service
@@ -354,7 +356,11 @@ def create_development_app() -> FastAPI:
 def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
     load_env_file()
     data_root = root_dir or os.environ.get("COSMIC_MEMORY_DATA_DIR", ".cosmic-memory-data")
-    embedding_service = _build_embedding_service_from_env(require_remote=True)
+    usage_logger = _build_usage_logger_from_env()
+    embedding_service = _build_embedding_service_from_env(
+        require_remote=True,
+        usage_logger=usage_logger,
+    )
     passive_index = _build_passive_index_from_env(
         embedding_service,
         default_path=str(Path(data_root) / "qdrant_data"),
@@ -362,11 +368,12 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
     graph_store = _build_graph_store_from_env(
         embedding_service,
         default_path=str(Path(data_root) / "qdrant_data"),
+        usage_logger=usage_logger,
     )
     graph_extractor = _build_deterministic_graph_extractor_from_env()
-    graph_llm_extractor = _build_graph_extractor_from_env()
-    ontology_curator = _build_ontology_curator_from_env()
-    return create_app(
+    graph_llm_extractor = _build_graph_extractor_from_env(usage_logger=usage_logger)
+    ontology_curator = _build_ontology_curator_from_env(usage_logger=usage_logger)
+    app = create_app(
         FilesystemMemoryService(
             data_root,
             passive_index=passive_index,
@@ -389,6 +396,8 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
         ),
         embedding_service=embedding_service,
     )
+    app.state.usage_logger = usage_logger
+    return app
 
 
 async def _close_if_present(resource) -> None:
@@ -398,7 +407,11 @@ async def _close_if_present(resource) -> None:
     await close()
 
 
-def _build_embedding_service_from_env(*, require_remote: bool = True) -> EmbeddingService:
+def _build_embedding_service_from_env(
+    *,
+    require_remote: bool = True,
+    usage_logger: GatewayUsageLogger | None = None,
+) -> EmbeddingService:
     dimensions = int(os.environ.get("COSMIC_MEMORY_EMBEDDING_DIMENSIONS", "1024"))
     model_name = os.environ.get("COSMIC_MEMORY_EMBEDDING_MODEL", "pplx-embed-v1-4b")
     batch_size = int(os.environ.get("COSMIC_MEMORY_EMBED_BATCH_SIZE", "128"))
@@ -427,6 +440,7 @@ def _build_embedding_service_from_env(*, require_remote: bool = True) -> Embeddi
         max_retries=max_retries,
         retry_base_seconds=retry_base_seconds,
         retry_max_seconds=retry_max_seconds,
+        usage_logger=usage_logger,
     )
 
 
@@ -549,12 +563,13 @@ def _build_graph_store_from_env(
     embedding_service: EmbeddingService,
     *,
     default_path: str | None = None,
+    usage_logger: GatewayUsageLogger | None = None,
 ):
     backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
     if backend in {"", "none", "off"}:
         return None
-    adjudicator = _build_graph_adjudicator_from_env()
-    fact_adjudicator = _build_graph_fact_adjudicator_from_env()
+    adjudicator = _build_graph_adjudicator_from_env(usage_logger=usage_logger)
+    fact_adjudicator = _build_graph_fact_adjudicator_from_env(usage_logger=usage_logger)
     entity_index = _build_entity_index_from_env(
         embedding_service,
         default_path=default_path,
@@ -626,7 +641,7 @@ def _build_entity_index_from_env(
     )
 
 
-def _build_graph_extractor_from_env():
+def _build_graph_extractor_from_env(*, usage_logger: GatewayUsageLogger | None = None):
     raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_ENABLED")
     api_key = os.environ.get("XAI_API_KEY")
     if raw_enabled is None:
@@ -657,10 +672,11 @@ def _build_graph_extractor_from_env():
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_EXTRACT_RETRY_MAX_SECONDS", "12.0")
         ),
+        usage_logger=usage_logger,
     )
 
 
-def _build_ontology_curator_from_env():
+def _build_ontology_curator_from_env(*, usage_logger: GatewayUsageLogger | None = None):
     raw_enabled = os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_ENABLED", "false")
     if raw_enabled.strip().lower() in {"0", "false", "no", "off"}:
         return None
@@ -687,6 +703,7 @@ def _build_ontology_curator_from_env():
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_MAX_SECONDS", "12.0")
         ),
+        usage_logger=usage_logger,
     )
 
 
@@ -699,7 +716,7 @@ def _build_deterministic_graph_extractor_from_env():
     )
 
 
-def _build_graph_adjudicator_from_env():
+def _build_graph_adjudicator_from_env(*, usage_logger: GatewayUsageLogger | None = None):
     raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED")
     api_key = os.environ.get("XAI_API_KEY")
     if raw_enabled is None:
@@ -731,10 +748,11 @@ def _build_graph_adjudicator_from_env():
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_ADJUDICATE_RETRY_MAX_SECONDS", "12.0")
         ),
+        usage_logger=usage_logger,
     )
 
 
-def _build_graph_fact_adjudicator_from_env():
+def _build_graph_fact_adjudicator_from_env(*, usage_logger: GatewayUsageLogger | None = None):
     raw_enabled = os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_ENABLED")
     api_key = os.environ.get("XAI_API_KEY")
     if raw_enabled is None:
@@ -766,4 +784,25 @@ def _build_graph_fact_adjudicator_from_env():
         retry_max_seconds=float(
             os.environ.get("COSMIC_MEMORY_GRAPH_FACT_ADJUDICATE_RETRY_MAX_SECONDS", "12.0")
         ),
+        usage_logger=usage_logger,
+    )
+
+
+def _build_usage_logger_from_env() -> GatewayUsageLogger | None:
+    gateway_url = os.environ.get("GATEWAY_URL", "").strip()
+    internal_token = (
+        os.environ.get("GATEWAY_INTERNAL_TOKEN")
+        or os.environ.get("COSMIC_MEMORY_INTERNAL_TOKEN")
+        or ""
+    ).strip()
+    if not gateway_url or not internal_token:
+        return None
+    return GatewayUsageLogger(
+        gateway_url=gateway_url,
+        internal_token=internal_token,
+        source_component="session_manager",
+        source_id=os.environ.get("COSMIC_MEMORY_SERVICE_ID", "cosmic-memory").strip() or "cosmic-memory",
+        timeout_sec=float(os.environ.get("COSMIC_MEMORY_USAGE_TIMEOUT_SEC", "2.5")),
+        max_attempts=int(os.environ.get("COSMIC_MEMORY_USAGE_MAX_ATTEMPTS", "2")),
+        retry_base_seconds=float(os.environ.get("COSMIC_MEMORY_USAGE_RETRY_BASE_SECONDS", "0.15")),
     )

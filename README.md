@@ -291,10 +291,18 @@ Gateway environment variables for the current integration:
 - `COSMIC_MEMORY_INGEST_TRANSCRIPTS` (default `true`)
 - `COSMIC_MEMORY_EPISODE_EXTRACT_GRAPH` (default `false`)
 
+Provider-usage logging:
+
+- `cosmic-memory` can post exact provider-reported usage into the Gateway Usage Ledger through `POST /internal/usage/log`,
+- this is best-effort and never blocks writes, graph ingest, or recall if the Gateway usage route is unavailable,
+- current emitted operations include `memory.embed`, `memory.graph_extract`, `memory.entity_adjudicate`, `memory.fact_adjudicate`, and `memory.ontology_curate`.
+
 Relevant environment variables:
 
 - `PERPLEXITY_API_KEY`
 - `XAI_API_KEY`
+- `GATEWAY_URL` (for example `http://127.0.0.1:8080`; required for usage-ledger posting)
+- `GATEWAY_INTERNAL_TOKEN` or `COSMIC_MEMORY_INTERNAL_TOKEN` (required for usage-ledger posting)
 - `COSMIC_MEMORY_EMBEDDING_MODEL` (default `pplx-embed-v1-4b`)
 - `COSMIC_MEMORY_EMBEDDING_DIMENSIONS` (default `1024`)
 - `COSMIC_MEMORY_EMBED_BATCH_SIZE` (default `128`)
@@ -337,6 +345,9 @@ Relevant environment variables:
 - `COSMIC_MEMORY_ONTOLOGY_CURATOR_MAX_RETRIES` (default `3`)
 - `COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_BASE_SECONDS` (default `1.0`)
 - `COSMIC_MEMORY_ONTOLOGY_CURATOR_RETRY_MAX_SECONDS` (default `12.0`)
+- `COSMIC_MEMORY_USAGE_TIMEOUT_SEC` (default `2.5`)
+- `COSMIC_MEMORY_USAGE_MAX_ATTEMPTS` (default `2`)
+- `COSMIC_MEMORY_USAGE_RETRY_BASE_SECONDS` (default `0.15`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_ENABLED` (default `true` when `XAI_API_KEY` is present)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_MODEL` (default `grok-4-1-fast-reasoning`)
 - `COSMIC_MEMORY_GRAPH_ADJUDICATE_MAX_PARALLEL` (default `2`)

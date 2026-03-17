@@ -11,6 +11,12 @@ from cosmic_memory.graph.fact_adjudication import (
     FactAdjudicationRequest,
     FactAdjudicationService,
 )
+from cosmic_memory.usage import (
+    GatewayUsageLogger,
+    begin_metered_call,
+    extract_provider_request_id,
+    extract_usage_payload,
+)
 
 _SYSTEM_PROMPT = """You adjudicate ambiguous graph fact updates inside Cosmic memory.
 
@@ -45,6 +51,7 @@ class XAIFactAdjudicationService:
         max_retries: int = 3,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 12.0,
+        usage_logger: GatewayUsageLogger | None = None,
         client=None,
     ) -> None:
         self.model_name = model_name
@@ -52,6 +59,7 @@ class XAIFactAdjudicationService:
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
+        self._usage_logger = usage_logger
         self._semaphore = asyncio.Semaphore(max(1, max_parallel_requests))
         self._owns_client = client is None
         self._client = client or self._build_client(api_key)
@@ -60,9 +68,27 @@ class XAIFactAdjudicationService:
         async with self._semaphore:
             attempt = 0
             while True:
+                metered_call = begin_metered_call(prefix="call")
                 try:
-                    return await asyncio.to_thread(self._adjudicate_once, request)
+                    result, raw_response = await asyncio.to_thread(self._adjudicate_once, request)
+                    await self._emit_usage(
+                        metered_call=metered_call,
+                        request=request,
+                        raw_response=raw_response,
+                        success=True,
+                        error_code=None,
+                        metadata_json={"attempt": attempt + 1},
+                    )
+                    return result
                 except Exception as exc:
+                    await self._emit_usage(
+                        metered_call=metered_call,
+                        request=request,
+                        raw_response=None,
+                        success=False,
+                        error_code=type(exc).__name__,
+                        metadata_json={"attempt": attempt + 1},
+                    )
                     if attempt >= self.max_retries or not _is_retryable_error(exc):
                         raise
                     delay = min(
@@ -79,7 +105,7 @@ class XAIFactAdjudicationService:
         if callable(close):
             await asyncio.to_thread(close)
 
-    def _adjudicate_once(self, request: FactAdjudicationRequest) -> FactAdjudicationDecision:
+    def _adjudicate_once(self, request: FactAdjudicationRequest) -> tuple[FactAdjudicationDecision, object]:
         from xai_sdk.chat import system, user
 
         chat = self._client.chat.create(
@@ -89,13 +115,13 @@ class XAIFactAdjudicationService:
         chat.append(system(_SYSTEM_PROMPT))
         chat.append(user(_build_user_prompt(request)))
 
-        parsed = None
+        raw_response = None
         if hasattr(chat, "parse"):
-            parsed = chat.parse(FactAdjudicationDecision)
+            raw_response = chat.parse(FactAdjudicationDecision)
         else:
             sampled = chat.sample()
-            parsed = getattr(sampled, "content", sampled)
-        return _coerce_decision(parsed)
+            raw_response = getattr(sampled, "content", sampled)
+        return _coerce_decision(raw_response), raw_response
 
     @staticmethod
     def _build_client(api_key: str | None):
@@ -111,6 +137,41 @@ class XAIFactAdjudicationService:
         if not resolved_api_key:
             raise ValueError("XAI_API_KEY is required for xAI fact adjudication.")
         return Client(api_key=resolved_api_key)
+
+    async def _emit_usage(
+        self,
+        *,
+        metered_call,
+        request: FactAdjudicationRequest,
+        raw_response: object,
+        success: bool,
+        error_code: str | None,
+        metadata_json: dict[str, object] | None,
+    ) -> None:
+        if self._usage_logger is None:
+            return
+        try:
+            await self._usage_logger.emit(
+                metered_call=metered_call,
+                provider="xai",
+                model=self.model_name,
+                usage_kind="chat_completion",
+                operation="memory.fact_adjudicate",
+                raw_usage=extract_usage_payload(raw_response),
+                provider_request_id=extract_provider_request_id(raw_response),
+                task_id=request.episode.task_id,
+                session_id=request.episode.session_id,
+                metadata_json={
+                    "memory_id": request.memory_id,
+                    "episode_id": request.episode.episode_id,
+                    "candidate_count": len(request.candidate_facts),
+                    **(metadata_json or {}),
+                },
+                success=success,
+                error_code=error_code,
+            )
+        except Exception:
+            return
 
 
 def _build_user_prompt(request: FactAdjudicationRequest) -> str:

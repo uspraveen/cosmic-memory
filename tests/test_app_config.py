@@ -9,6 +9,7 @@ from cosmic_memory.server.app import (
     _build_graph_extractor_from_env,
     _build_ontology_curator_from_env,
     _build_graph_store_from_env,
+    _build_usage_logger_from_env,
     _graph_async_writes_enabled,
     _graph_warm_cache_on_startup_enabled,
     _graph_sync_on_startup_enabled,
@@ -38,6 +39,35 @@ def test_build_embedding_service_can_use_dev_fallback(monkeypatch: pytest.Monkey
     service = _build_embedding_service_from_env(require_remote=False)
 
     assert isinstance(service, HashEmbeddingService)
+
+
+def test_build_usage_logger_requires_gateway_url_and_internal_token(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("GATEWAY_URL", raising=False)
+    monkeypatch.delenv("GATEWAY_INTERNAL_TOKEN", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_INTERNAL_TOKEN", raising=False)
+
+    assert _build_usage_logger_from_env() is None
+
+
+def test_build_usage_logger_can_construct_logger(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GATEWAY_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("GATEWAY_INTERNAL_TOKEN", "internal-token")
+    monkeypatch.setenv("COSMIC_MEMORY_USAGE_TIMEOUT_SEC", "3.5")
+    monkeypatch.setenv("COSMIC_MEMORY_USAGE_MAX_ATTEMPTS", "4")
+    monkeypatch.setenv("COSMIC_MEMORY_USAGE_RETRY_BASE_SECONDS", "0.25")
+    monkeypatch.setenv("COSMIC_MEMORY_SERVICE_ID", "cosmic-memory:test")
+
+    logger = _build_usage_logger_from_env()
+
+    assert logger is not None
+    assert logger.gateway_url == "http://127.0.0.1:8080"
+    assert logger.internal_token == "internal-token"
+    assert logger.timeout_sec == 3.5
+    assert logger.max_attempts == 4
+    assert logger.retry_base_seconds == 0.25
+    assert logger.source_id == "cosmic-memory:test"
 
 
 def test_build_graph_store_requires_neo4j_env(monkeypatch: pytest.MonkeyPatch):

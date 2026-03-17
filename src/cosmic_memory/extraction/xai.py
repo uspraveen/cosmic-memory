@@ -13,6 +13,12 @@ from cosmic_memory.domain.models import OntologyAliasItem
 from cosmic_memory.domain.models import MemoryRecord
 from cosmic_memory.extraction.models import GraphExtractionResult
 from cosmic_memory.graph.ontology import EntityType, RelationType
+from cosmic_memory.usage import (
+    GatewayUsageLogger,
+    begin_metered_call,
+    extract_provider_request_id,
+    extract_usage_payload,
+)
 
 _SYSTEM_PROMPT = """You extract structured graph memory for Cosmic.
 
@@ -64,6 +70,7 @@ class XAIGraphExtractionService:
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 12.0,
         ontology_alias_provider: Callable[[], Sequence[OntologyAliasItem]] | None = None,
+        usage_logger: GatewayUsageLogger | None = None,
         client=None,
     ) -> None:
         self.model_name = model_name
@@ -73,6 +80,7 @@ class XAIGraphExtractionService:
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
         self._ontology_alias_provider = ontology_alias_provider
+        self._usage_logger = usage_logger
         self._semaphore = asyncio.Semaphore(max(1, max_parallel_requests))
         self._owns_client = client is None
         self._client = client or self._build_client(api_key)
@@ -84,9 +92,31 @@ class XAIGraphExtractionService:
         async with self._semaphore:
             attempt = 0
             while True:
+                metered_call = begin_metered_call(prefix="call")
                 try:
-                    return await asyncio.to_thread(self._extract_once, record)
+                    result, raw_response = await asyncio.to_thread(self._extract_once, record)
+                    await self._emit_usage(
+                        metered_call=metered_call,
+                        record=record,
+                        raw_response=raw_response,
+                        success=True,
+                        error_code=None,
+                        metadata_json={
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    return result
                 except Exception as exc:
+                    await self._emit_usage(
+                        metered_call=metered_call,
+                        record=record,
+                        raw_response=None,
+                        success=False,
+                        error_code=type(exc).__name__,
+                        metadata_json={
+                            "attempt": attempt + 1,
+                        },
+                    )
                     if attempt >= self.max_retries or not _is_retryable_error(exc):
                         raise
                     delay = min(
@@ -109,7 +139,7 @@ class XAIGraphExtractionService:
     ) -> None:
         self._ontology_alias_provider = provider
 
-    def _extract_once(self, record: MemoryRecord) -> GraphExtractionResult:
+    def _extract_once(self, record: MemoryRecord) -> tuple[GraphExtractionResult, object]:
         from xai_sdk.chat import system, user
 
         chat = self._client.chat.create(
@@ -128,13 +158,13 @@ class XAIGraphExtractionService:
             )
         )
 
-        parsed = None
+        raw_response = None
         if hasattr(chat, "parse"):
-            parsed = chat.parse(GraphExtractionResult)
+            raw_response = chat.parse(GraphExtractionResult)
         else:
             sampled = chat.sample()
-            parsed = getattr(sampled, "content", sampled)
-        return _coerce_extraction_result(parsed)
+            raw_response = getattr(sampled, "content", sampled)
+        return _coerce_extraction_result(raw_response), raw_response
 
     @staticmethod
     def _build_client(api_key: str | None):
@@ -159,6 +189,43 @@ class XAIGraphExtractionService:
         except Exception:
             return ()
         return aliases or ()
+
+    async def _emit_usage(
+        self,
+        *,
+        metered_call,
+        record: MemoryRecord,
+        raw_response: object,
+        success: bool,
+        error_code: str | None,
+        metadata_json: dict[str, object] | None,
+    ) -> None:
+        if self._usage_logger is None:
+            return
+        try:
+            await self._usage_logger.emit(
+                metered_call=metered_call,
+                provider="xai",
+                model=self.model_name,
+                usage_kind="chat_completion",
+                operation="memory.graph_extract",
+                raw_usage=extract_usage_payload(raw_response),
+                provider_request_id=extract_provider_request_id(raw_response),
+                task_id=record.provenance.task_id,
+                session_id=record.provenance.session_id,
+                request_id=str(record.metadata.get("request_id") or "").strip() or None,
+                success=success,
+                error_code=error_code,
+                metadata_json={
+                    "memory_id": record.memory_id,
+                    "memory_kind": record.kind.value,
+                    "source_kind": record.provenance.source_kind,
+                    "source_id": record.provenance.source_id,
+                    **(metadata_json or {}),
+                },
+            )
+        except Exception:
+            return
 
 
 def _build_user_prompt(
