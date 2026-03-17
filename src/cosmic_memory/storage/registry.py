@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel
 
@@ -26,6 +27,23 @@ class RegistryEntry(BaseModel):
     superseded_by: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class GraphSyncQueueEntry(BaseModel):
+    job_id: int
+    memory_id: str
+    content_hash: str
+    status: str
+    attempts: int
+    allow_llm: bool
+    persist_graph_document: bool
+    queued_at: datetime
+    available_at: datetime
+    updated_at: datetime
+    lease_token: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_error: str | None = None
 
 
 class SQLiteMemoryRegistry:
@@ -181,6 +199,244 @@ class SQLiteMemoryRegistry:
 
         return [self._row_to_entry(row) for row in rows]
 
+    def enqueue_graph_sync(
+        self,
+        *,
+        memory_id: str,
+        content_hash: str,
+        allow_llm: bool,
+        persist_graph_document: bool,
+    ) -> GraphSyncQueueEntry:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT job_id
+                FROM graph_sync_queue
+                WHERE memory_id = ?
+                  AND content_hash = ?
+                  AND allow_llm = ?
+                  AND persist_graph_document = ?
+                  AND status IN ('pending', 'running', 'failed')
+                ORDER BY job_id DESC
+                LIMIT 1
+                """,
+                (
+                    memory_id,
+                    content_hash,
+                    1 if allow_llm else 0,
+                    1 if persist_graph_document else 0,
+                ),
+            ).fetchone()
+            if existing is not None:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM graph_sync_queue
+                    WHERE job_id = ?
+                    """,
+                    (existing["job_id"],),
+                ).fetchone()
+                return self._row_to_graph_sync_queue_entry(row)
+
+            cursor = conn.execute(
+                """
+                INSERT INTO graph_sync_queue (
+                    memory_id,
+                    content_hash,
+                    status,
+                    attempts,
+                    allow_llm,
+                    persist_graph_document,
+                    queued_at,
+                    available_at,
+                    updated_at,
+                    lease_token,
+                    started_at,
+                    completed_at,
+                    last_error
+                ) VALUES (?, ?, 'pending', 0, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    memory_id,
+                    content_hash,
+                    1 if allow_llm else 0,
+                    1 if persist_graph_document else 0,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM graph_sync_queue
+                WHERE job_id = ?
+                """,
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return self._row_to_graph_sync_queue_entry(row)
+
+    def lease_next_graph_sync_job(self) -> GraphSyncQueueEntry | None:
+        now = datetime.now().isoformat()
+        lease_token = uuid4().hex
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM graph_sync_queue
+                WHERE status IN ('pending', 'failed')
+                  AND available_at <= ?
+                ORDER BY
+                  CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+                  queued_at ASC,
+                  job_id ASC
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            updated = conn.execute(
+                """
+                UPDATE graph_sync_queue
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    updated_at = ?,
+                    started_at = ?,
+                    lease_token = ?
+                WHERE job_id = ?
+                  AND status IN ('pending', 'failed')
+                """,
+                (
+                    now,
+                    now,
+                    lease_token,
+                    row["job_id"],
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+
+            leased = conn.execute(
+                """
+                SELECT *
+                FROM graph_sync_queue
+                WHERE job_id = ?
+                """,
+                (row["job_id"],),
+            ).fetchone()
+        return self._row_to_graph_sync_queue_entry(leased)
+
+    def mark_graph_sync_job_succeeded(
+        self,
+        *,
+        job_id: int,
+        lease_token: str,
+        status: str = "succeeded",
+        last_error: str | None = None,
+    ) -> None:
+        if status not in {"succeeded", "stale"}:
+            raise ValueError("Unsupported graph sync completion status.")
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE graph_sync_queue
+                SET status = ?,
+                    updated_at = ?,
+                    completed_at = ?,
+                    lease_token = NULL,
+                    last_error = ?
+                WHERE job_id = ?
+                  AND lease_token = ?
+                """,
+                (
+                    status,
+                    now,
+                    now,
+                    last_error,
+                    job_id,
+                    lease_token,
+                ),
+            )
+
+    def mark_graph_sync_job_failed(
+        self,
+        *,
+        job_id: int,
+        lease_token: str,
+        error_message: str,
+        retry_delay_seconds: float,
+    ) -> None:
+        now = datetime.now()
+        available_at = now + timedelta(seconds=max(0.0, retry_delay_seconds))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE graph_sync_queue
+                SET status = 'failed',
+                    updated_at = ?,
+                    available_at = ?,
+                    completed_at = NULL,
+                    lease_token = NULL,
+                    last_error = ?
+                WHERE job_id = ?
+                  AND lease_token = ?
+                """,
+                (
+                    now.isoformat(),
+                    available_at.isoformat(),
+                    error_message,
+                    job_id,
+                    lease_token,
+                ),
+            )
+
+    def requeue_running_graph_sync_jobs(self) -> int:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE graph_sync_queue
+                SET status = 'pending',
+                    updated_at = ?,
+                    available_at = ?,
+                    lease_token = NULL,
+                    started_at = NULL,
+                    completed_at = NULL
+                WHERE status = 'running'
+                """,
+                (
+                    now,
+                    now,
+                ),
+            )
+            return int(updated.rowcount or 0)
+
+    def graph_sync_queue_counts(self) -> dict[str, int]:
+        counts = {
+            "pending": 0,
+            "running": 0,
+            "failed": 0,
+            "succeeded": 0,
+            "stale": 0,
+        }
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM graph_sync_queue
+                GROUP BY status
+                """
+            ).fetchall()
+        for row in rows:
+            status = str(row["status"])
+            if status in counts:
+                counts[status] = int(row["count"] or 0)
+        return counts
+
     def _initialize(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -207,6 +463,38 @@ class SQLiteMemoryRegistry:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_registry_updated_at ON memory_registry(updated_at)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS graph_sync_queue (
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    allow_llm INTEGER NOT NULL DEFAULT 1,
+                    persist_graph_document INTEGER NOT NULL DEFAULT 1,
+                    queued_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_token TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_graph_sync_queue_status_available
+                ON graph_sync_queue(status, available_at, queued_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_graph_sync_queue_memory_id
+                ON graph_sync_queue(memory_id, queued_at)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -230,4 +518,25 @@ class SQLiteMemoryRegistry:
             superseded_by=row["superseded_by"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_graph_sync_queue_entry(row: sqlite3.Row) -> GraphSyncQueueEntry:
+        return GraphSyncQueueEntry(
+            job_id=int(row["job_id"]),
+            memory_id=row["memory_id"],
+            content_hash=row["content_hash"],
+            status=row["status"],
+            attempts=int(row["attempts"] or 0),
+            allow_llm=bool(row["allow_llm"]),
+            persist_graph_document=bool(row["persist_graph_document"]),
+            queued_at=datetime.fromisoformat(row["queued_at"]),
+            available_at=datetime.fromisoformat(row["available_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            lease_token=row["lease_token"],
+            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            completed_at=(
+                datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
+            ),
+            last_error=row["last_error"],
         )

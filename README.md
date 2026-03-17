@@ -108,6 +108,8 @@ sequenceDiagram
     CM-->>GW: MemoryRecord + memory_id
 ```
 
+When `COSMIC_MEMORY_ASYNC_GRAPH_WRITES=true`, canonical markdown persistence, SQLite registry updates, and passive Qdrant sync stay on the request path, while graph extraction and graph-store ingest run through a durable background queue so slow xAI/Neo4j work does not block writes.
+
 ### Observation Ingestion
 
 ```mermaid
@@ -306,6 +308,10 @@ Relevant environment variables:
 - `COSMIC_MEMORY_GRAPH_BACKEND` (`none`, `memory`, or `neo4j`, default `none`)
 - `COSMIC_MEMORY_GRAPH_SYNC_ON_STARTUP` (default `true` for `memory`, otherwise `false`)
 - `COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP` (default `true` for `neo4j`, otherwise `false`)
+- `COSMIC_MEMORY_ASYNC_GRAPH_WRITES` (default `true` when a graph backend is enabled)
+- `COSMIC_MEMORY_GRAPH_WRITE_POLL_SECONDS` (default `0.5`)
+- `COSMIC_MEMORY_GRAPH_WRITE_RETRY_BASE_SECONDS` (default `5.0`)
+- `COSMIC_MEMORY_GRAPH_WRITE_RETRY_MAX_SECONDS` (default `300.0`)
 - `COSMIC_MEMORY_GRAPH_DETERMINISTIC_ENABLED` (default `true`)
 - `COSMIC_MEMORY_NEO4J_URI`
 - `COSMIC_MEMORY_NEO4J_USERNAME`

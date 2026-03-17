@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -95,6 +96,10 @@ class FilesystemMemoryService:
         graph_llm_extractor: GraphExtractionService | None = None,
         index_sync_batch_size: int = 128,
         passive_graph_timeout_seconds: float = 0.12,
+        async_graph_writes: bool = False,
+        graph_write_worker_poll_seconds: float = 0.5,
+        graph_write_retry_base_seconds: float = 5.0,
+        graph_write_retry_max_seconds: float = 300.0,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -106,11 +111,23 @@ class FilesystemMemoryService:
         self.graph_llm_extractor = graph_llm_extractor
         self.index_sync_batch_size = index_sync_batch_size
         self.passive_graph_timeout_seconds = passive_graph_timeout_seconds
+        self.async_graph_writes = async_graph_writes
+        self.graph_write_worker_poll_seconds = max(0.05, graph_write_worker_poll_seconds)
+        self.graph_write_retry_base_seconds = max(0.1, graph_write_retry_base_seconds)
+        self.graph_write_retry_max_seconds = max(
+            self.graph_write_retry_base_seconds,
+            graph_write_retry_max_seconds,
+        )
+        self._graph_write_event = asyncio.Event()
+        self._graph_write_shutdown = asyncio.Event()
+        self._graph_write_task: asyncio.Task | None = None
+        self._graph_operation_lock = asyncio.Lock()
 
     async def health(self) -> HealthStatus:
         if self.passive_index is not None:
             await self.passive_index.ensure_ready()
         stats = await self._graph_store_stats()
+        queue_counts = self.registry.graph_sync_queue_counts()
         return HealthStatus(
             ok=True,
             mode="filesystem_canonical",
@@ -129,7 +146,47 @@ class FilesystemMemoryService:
             graph_cache_episode_count=stats.cache_episode_count if stats is not None else 0,
             graph_cache_hydrated_at=stats.cache_hydrated_at if stats is not None else None,
             graph_cache_build_ms=stats.cache_build_ms if stats is not None else None,
+            graph_queue_pending_count=queue_counts.get("pending", 0),
+            graph_queue_running_count=queue_counts.get("running", 0),
+            graph_queue_failed_count=queue_counts.get("failed", 0),
         )
+
+    async def start_background_tasks(self) -> None:
+        if not self._graph_writes_enabled():
+            return
+        requeued = self.registry.requeue_running_graph_sync_jobs()
+        if requeued:
+            logger.warning("memory.graph_write_jobs_requeued count=%s", requeued)
+        self._graph_write_shutdown.clear()
+        self._graph_write_event.set()
+        if self._graph_write_task is not None and not self._graph_write_task.done():
+            return
+        self._graph_write_task = asyncio.create_task(
+            self._graph_write_worker(),
+            name="cosmic-memory-graph-write-worker",
+        )
+
+    async def stop_background_tasks(self) -> None:
+        self._graph_write_shutdown.set()
+        self._graph_write_event.set()
+        if self._graph_write_task is None:
+            return
+        self._graph_write_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._graph_write_task
+        self._graph_write_task = None
+        self._graph_write_event.clear()
+        self._graph_write_shutdown.clear()
+
+    async def wait_for_graph_queue_idle(self, *, timeout_seconds: float = 10.0) -> dict[str, int]:
+        deadline = asyncio.get_running_loop().time() + max(0.1, timeout_seconds)
+        while True:
+            counts = self.registry.graph_sync_queue_counts()
+            if counts.get("pending", 0) == 0 and counts.get("running", 0) == 0:
+                return counts
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("Timed out waiting for graph sync queue to become idle.")
+            await asyncio.sleep(0.05)
 
     async def write(self, request: WriteMemoryRequest) -> MemoryRecord:
         record = MemoryRecord(
@@ -706,10 +763,12 @@ class FilesystemMemoryService:
         )
 
     async def sync_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse:
-        return await self._sync_graph(mode="sync", request=request or GraphSyncRequest())
+        async with self._graph_operation_lock:
+            return await self._sync_graph(mode="sync", request=request or GraphSyncRequest())
 
     async def rebuild_graph(self, request: GraphSyncRequest | None = None) -> GraphSyncResponse:
-        return await self._sync_graph(mode="rebuild", request=request or GraphSyncRequest())
+        async with self._graph_operation_lock:
+            return await self._sync_graph(mode="rebuild", request=request or GraphSyncRequest())
 
     async def supersede(
         self, memory_id: str, request: SupersedeMemoryRequest
@@ -742,8 +801,26 @@ class FilesystemMemoryService:
 
     async def _persist(self, record: MemoryRecord) -> None:
         if record.status == RecordStatus.ACTIVE:
-            await self._prepare_record(record)
-        await self._write_canonical_record(record, sync_passive_index=True)
+            await self._prepare_record(record, allow_llm=not self._graph_writes_enabled())
+        snapshot = await self._write_canonical_record(record, sync_passive_index=True)
+        if self._graph_writes_enabled():
+            allow_llm = record.status == RecordStatus.ACTIVE
+            persist_graph_document = record.status == RecordStatus.ACTIVE
+            job = self._enqueue_graph_sync(
+                memory_id=record.memory_id,
+                content_hash=snapshot.content_hash,
+                allow_llm=allow_llm,
+                persist_graph_document=persist_graph_document,
+            )
+            logger.info(
+                "memory.graph_write_enqueued memory_id=%s kind=%s job_id=%s allow_llm=%s persist_graph_document=%s",
+                record.memory_id,
+                record.kind.value,
+                job.job_id,
+                allow_llm,
+                persist_graph_document,
+            )
+            return
         await self._sync_graph_record(record)
 
     async def _write_canonical_record(
@@ -1116,6 +1193,137 @@ class FilesystemMemoryService:
             llm_backfill_enabled=request.allow_llm,
             cache_warmed=cache_warmed,
             status=status,
+        )
+
+    def _graph_writes_enabled(self) -> bool:
+        return self.async_graph_writes and self.graph_store is not None
+
+    def _enqueue_graph_sync(
+        self,
+        *,
+        memory_id: str,
+        content_hash: str,
+        allow_llm: bool,
+        persist_graph_document: bool,
+    ):
+        job = self.registry.enqueue_graph_sync(
+            memory_id=memory_id,
+            content_hash=content_hash,
+            allow_llm=allow_llm,
+            persist_graph_document=persist_graph_document,
+        )
+        self._graph_write_event.set()
+        return job
+
+    async def _graph_write_worker(self) -> None:
+        logger.info("memory.graph_write_worker_started")
+        try:
+            while not self._graph_write_shutdown.is_set():
+                job = self.registry.lease_next_graph_sync_job()
+                if job is None:
+                    self._graph_write_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._graph_write_event.wait(),
+                            timeout=self.graph_write_worker_poll_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                await self._process_graph_sync_job(job)
+        except asyncio.CancelledError:
+            logger.info("memory.graph_write_worker_cancelled")
+            raise
+        finally:
+            logger.info("memory.graph_write_worker_stopped")
+
+    async def _process_graph_sync_job(self, job) -> None:
+        lease_token = job.lease_token or ""
+        entry = self.registry.get(job.memory_id)
+        if entry is None:
+            self.registry.mark_graph_sync_job_succeeded(
+                job_id=job.job_id,
+                lease_token=lease_token,
+                status="stale",
+                last_error="registry entry missing",
+            )
+            logger.info(
+                "memory.graph_write_job_stale job_id=%s memory_id=%s reason=registry_missing",
+                job.job_id,
+                job.memory_id,
+            )
+            return
+        if entry.content_hash != job.content_hash:
+            self.registry.mark_graph_sync_job_succeeded(
+                job_id=job.job_id,
+                lease_token=lease_token,
+                status="stale",
+                last_error="content hash changed",
+            )
+            logger.info(
+                "memory.graph_write_job_stale job_id=%s memory_id=%s reason=content_hash_changed current_hash=%s job_hash=%s",
+                job.job_id,
+                job.memory_id,
+                entry.content_hash,
+                job.content_hash,
+            )
+            return
+        path = Path(entry.path)
+        if not path.exists():
+            self.registry.mark_graph_sync_job_succeeded(
+                job_id=job.job_id,
+                lease_token=lease_token,
+                status="stale",
+                last_error="canonical file missing",
+            )
+            logger.info(
+                "memory.graph_write_job_stale job_id=%s memory_id=%s reason=canonical_missing",
+                job.job_id,
+                job.memory_id,
+            )
+            return
+        try:
+            record = self.record_store.read(path)
+            async with self._graph_operation_lock:
+                await self._sync_graph_record(
+                    record,
+                    allow_llm=job.allow_llm,
+                    persist_graph_document=job.persist_graph_document,
+                )
+        except Exception as exc:
+            retry_delay_seconds = self._graph_retry_delay(job.attempts)
+            error_message = f"{type(exc).__name__}: {exc}"
+            self.registry.mark_graph_sync_job_failed(
+                job_id=job.job_id,
+                lease_token=lease_token,
+                error_message=error_message[:2000],
+                retry_delay_seconds=retry_delay_seconds,
+            )
+            logger.exception(
+                "memory.graph_write_job_failed job_id=%s memory_id=%s attempts=%s retry_delay_seconds=%s",
+                job.job_id,
+                job.memory_id,
+                job.attempts,
+                retry_delay_seconds,
+            )
+            return
+        self.registry.mark_graph_sync_job_succeeded(
+            job_id=job.job_id,
+            lease_token=lease_token,
+            status="succeeded",
+        )
+        logger.info(
+            "memory.graph_write_job_succeeded job_id=%s memory_id=%s attempts=%s",
+            job.job_id,
+            job.memory_id,
+            job.attempts,
+        )
+
+    def _graph_retry_delay(self, attempts: int) -> float:
+        exponent = max(0, attempts - 1)
+        return min(
+            self.graph_write_retry_max_seconds,
+            self.graph_write_retry_base_seconds * (2**exponent),
         )
 
     async def _sync_graph_record(

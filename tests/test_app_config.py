@@ -8,8 +8,12 @@ from cosmic_memory.server.app import (
     _build_graph_adjudicator_from_env,
     _build_graph_extractor_from_env,
     _build_graph_store_from_env,
+    _graph_async_writes_enabled,
     _graph_warm_cache_on_startup_enabled,
     _graph_sync_on_startup_enabled,
+    _graph_write_retry_base_seconds,
+    _graph_write_retry_max_seconds,
+    _graph_write_worker_poll_seconds,
     _build_passive_index_from_env,
 )
 
@@ -194,6 +198,30 @@ def test_graph_warm_cache_on_startup_can_be_disabled(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("COSMIC_MEMORY_GRAPH_WARM_CACHE_ON_STARTUP", "false")
 
     assert _graph_warm_cache_on_startup_enabled() is False
+
+
+def test_graph_async_writes_default_on_for_graph_backends(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_ASYNC_GRAPH_WRITES", raising=False)
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
+
+    assert _graph_async_writes_enabled() is True
+
+
+def test_graph_async_writes_can_be_disabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("COSMIC_MEMORY_ASYNC_GRAPH_WRITES", "false")
+    monkeypatch.setenv("COSMIC_MEMORY_GRAPH_BACKEND", "neo4j")
+
+    assert _graph_async_writes_enabled() is False
+
+
+def test_graph_write_tuning_env_defaults(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_WRITE_POLL_SECONDS", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_WRITE_RETRY_BASE_SECONDS", raising=False)
+    monkeypatch.delenv("COSMIC_MEMORY_GRAPH_WRITE_RETRY_MAX_SECONDS", raising=False)
+
+    assert _graph_write_worker_poll_seconds() == pytest.approx(0.5)
+    assert _graph_write_retry_base_seconds() == pytest.approx(5.0)
+    assert _graph_write_retry_max_seconds() == pytest.approx(300.0)
 
 
 def test_build_graph_adjudicator_requires_xai_api_key_when_enabled(monkeypatch: pytest.MonkeyPatch):

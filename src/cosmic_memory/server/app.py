@@ -88,12 +88,24 @@ def create_app(
                     await warm_graph_cache()
                 except Exception:
                     logger.exception("cosmic_memory.graph_cache_warm_on_startup_failed")
+        start_background_tasks = getattr(app.state.memory_service, "start_background_tasks", None)
+        if start_background_tasks is not None:
+            await start_background_tasks()
         yield
+        stop_background_tasks = getattr(app.state.memory_service, "stop_background_tasks", None)
+        if stop_background_tasks is not None:
+            await stop_background_tasks()
         await _close_if_present(getattr(app.state, "embedding_service", None))
         passive_index = getattr(getattr(app.state, "memory_service", None), "passive_index", None)
         await _close_if_present(passive_index)
         graph_extractor = getattr(getattr(app.state, "memory_service", None), "graph_extractor", None)
         await _close_if_present(graph_extractor)
+        graph_llm_extractor = getattr(
+            getattr(app.state, "memory_service", None),
+            "graph_llm_extractor",
+            None,
+        )
+        await _close_if_present(graph_llm_extractor)
         graph_store = getattr(getattr(app.state, "memory_service", None), "graph_store", None)
         await _close_if_present(graph_store)
 
@@ -343,6 +355,10 @@ def create_filesystem_app(root_dir: str | None = None) -> FastAPI:
                 os.environ.get("COSMIC_MEMORY_PASSIVE_GRAPH_TIMEOUT_MS", "120")
             )
             / 1000.0,
+            async_graph_writes=_graph_async_writes_enabled(),
+            graph_write_worker_poll_seconds=_graph_write_worker_poll_seconds(),
+            graph_write_retry_base_seconds=_graph_write_retry_base_seconds(),
+            graph_write_retry_max_seconds=_graph_write_retry_max_seconds(),
         ),
         embedding_service=embedding_service,
     )
@@ -450,6 +466,33 @@ def _graph_warm_cache_on_startup_enabled() -> bool:
         return raw.strip().lower() not in {"0", "false", "no", "off"}
     backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
     return backend == "neo4j"
+
+
+def _graph_async_writes_enabled() -> bool:
+    raw = os.environ.get("COSMIC_MEMORY_ASYNC_GRAPH_WRITES")
+    if raw is not None:
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    backend = os.environ.get("COSMIC_MEMORY_GRAPH_BACKEND", "none").strip().lower()
+    return backend not in {"", "none", "off"}
+
+
+def _graph_write_worker_poll_seconds() -> float:
+    return max(0.05, float(os.environ.get("COSMIC_MEMORY_GRAPH_WRITE_POLL_SECONDS", "0.5")))
+
+
+def _graph_write_retry_base_seconds() -> float:
+    return max(
+        0.1,
+        float(os.environ.get("COSMIC_MEMORY_GRAPH_WRITE_RETRY_BASE_SECONDS", "5.0")),
+    )
+
+
+def _graph_write_retry_max_seconds() -> float:
+    base_seconds = _graph_write_retry_base_seconds()
+    return max(
+        base_seconds,
+        float(os.environ.get("COSMIC_MEMORY_GRAPH_WRITE_RETRY_MAX_SECONDS", "300.0")),
+    )
 
 
 def _build_graph_store_from_env(

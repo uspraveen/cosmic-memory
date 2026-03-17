@@ -389,3 +389,6 @@ class HealthStatus(BaseModel):
     graph_cache_episode_count: int = 0
     graph_cache_hydrated_at: datetime | None = None
     graph_cache_build_ms: float | None = None
+    graph_queue_pending_count: int = 0
+    graph_queue_running_count: int = 0
+    graph_queue_failed_count: int = 0
