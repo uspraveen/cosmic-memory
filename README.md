@@ -79,6 +79,7 @@ flowchart LR
 sequenceDiagram
     participant GW as Gateway / Agent
     participant CM as cosmic-memory
+    participant GQ as Graph Queue Worker
     participant X as xAI Extractor
     participant OC as Ontology Curator
     participant A as Memory Adjudicator
@@ -91,7 +92,26 @@ sequenceDiagram
     GW->>CM: write(memory)
     CM->>MD: persist canonical .md record
     CM->>REG: upsert registry snapshot
-    alt graph extraction enabled
+    CM->>Q: upsert passive memory point
+    alt async graph writes enabled
+        CM->>REG: enqueue durable graph sync job
+        CM-->>GW: MemoryRecord + memory_id
+        GQ->>REG: lease queued graph job
+        GQ->>X: extract entities / relations / time anchors
+        X-->>GQ: graph_document
+        X-->>GQ: weak-fit ontology observations
+        GQ->>MD: write normalized graph metadata
+        GQ->>GQ: build episode provenance record
+        GQ->>A: adjudicate ambiguous entity merges
+        A-->>GQ: merge / candidate / create_new
+        GQ->>G: find active compatible facts
+        G-->>GQ: candidate active facts + episode lineage
+        GQ->>A: adjudicate ambiguous fact invalidation
+        A-->>GQ: keep_both / merge / invalidate_existing / discard_new
+        GQ->>G: ingest graph_document
+        G->>EI: sync changed entities
+        GQ->>REG: mark complete / retry with backoff
+    else graph extraction enabled on request path
         CM->>X: extract entities / relations / time anchors
         X-->>CM: graph_document
         X-->>CM: weak-fit ontology observations
@@ -105,13 +125,15 @@ sequenceDiagram
         A-->>CM: keep_both / merge / invalidate_existing / discard_new
         CM->>G: ingest graph_document
         G->>EI: sync changed entities
+        CM-->>GW: MemoryRecord + memory_id
+    else graph extraction disabled
+        CM-->>GW: MemoryRecord + memory_id
     end
-    CM->>Q: upsert passive memory point
-    CM-->>GW: MemoryRecord + memory_id
     Note over CM,OC: Scheduled ontology curator batches recurring weak-fit observations into learned aliases without mutating the hard ontology on the hot path.
 ```
 
 When `COSMIC_MEMORY_ASYNC_GRAPH_WRITES=true`, canonical markdown persistence, SQLite registry updates, and passive Qdrant sync stay on the request path, while graph extraction and graph-store ingest run through a durable background queue so slow xAI/Neo4j work does not block writes.
+The queue is stored in the SQLite registry, survives restarts, requeues interrupted leased jobs on startup, and retries failed graph jobs with bounded exponential backoff.
 
 ### Observation Ingestion
 
@@ -182,6 +204,8 @@ The current milestone in this repo provides:
 - internal xAI-backed fact adjudication for ambiguous active-fact invalidation,
 - soft ontology observation capture on write and a scheduled xAI curator loop for learned aliasing,
 - document-level graph dedup normalization before graph ingest,
+- a durable SQLite-backed async graph-sync queue with restart-safe requeue and retry backoff,
+- a persistent Neo4j graph projection with read-cache warming for production deployments,
 - a dedicated entity-similarity index for entity candidate generation and graph seeding,
 - first-class graph episodes for provenance and lineage,
 - structured active-fact lookup for compatible entities, relations, and time windows,
@@ -191,6 +215,7 @@ The current milestone in this repo provides:
 - a compact agent/orchestrator memory control surface,
 - schema injection, query planning, identity resolution, current-state lookup, temporal fact lookup, and structured memory briefs,
 - a first-class `ingest_episode(...)` path for turning runtime observations into canonical transcript memories,
+- exact provider-usage logging into the Gateway Usage Ledger using provider-reported token metrics,
 - a thin FastAPI server,
 - an in-memory development implementation for contract testing.
 
@@ -242,6 +267,10 @@ Production app factories enable deterministic write-time graph extraction for
 obvious memory writes by default. If `XAI_API_KEY` is present, they also enable
 xAI-backed write-time graph extraction with `grok-4-1-fast-reasoning` as a
 fallback on live writes.
+When a graph backend is enabled, async graph writes default on so the request
+path can return after canonical persistence and passive indexing while graph
+work finishes through the durable queue. Neo4j deployments can also warm the
+read-only graph cache on startup.
 
 Production app factories also load a local `.env` file if present. A placeholder
 is included in [.env.example](C:/Users/Praveen Raj U S/Downloads/cosmic-memory/.env.example).
@@ -294,7 +323,8 @@ Gateway environment variables for the current integration:
 Provider-usage logging:
 
 - `cosmic-memory` can post exact provider-reported usage into the Gateway Usage Ledger through `POST /internal/usage/log`,
-- this is best-effort and never blocks writes, graph ingest, or recall if the Gateway usage route is unavailable,
+- the Gateway may respond with `202 Accepted` because it queues ledger writes internally; `cosmic-memory` treats that as success,
+- this is best-effort and never fails the main write, graph, or recall operation if the Gateway usage route is unavailable,
 - current emitted operations include `memory.embed`, `memory.graph_extract`, `memory.entity_adjudicate`, `memory.fact_adjudicate`, and `memory.ontology_curate`.
 
 Relevant environment variables:
@@ -429,7 +459,7 @@ Current server endpoints:
 
 | Method | Path | Purpose | Used By | Notes |
 | --- | --- | --- | --- | --- |
-| `GET` | `/health` | Health/status check for the service. | Infra, local dev, Gateway | Not memory-specific. |
+| `GET` | `/health` | Health/status check for the service. | Infra, local dev, Gateway | Includes graph backend, cache, queue, and ontology-curator counters. |
 | `POST` | `/v1/embeddings/generate` | Generate dense embeddings through the configured embedding backend. | Internal tooling, diagnostics, future batch jobs | Not on the normal recall hot path. |
 | `POST` | `/v1/memories` | Write a canonical long-term memory record. | Gateway, agents, orchestrator | Canonical `.md` write path. |
 | `POST` | `/v1/episodes` | Turn runtime observations into a canonical transcript/episode record. | Gateway, orchestrator | High-level observation ingestion path. Can optionally trigger graph extraction. |
