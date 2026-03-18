@@ -103,6 +103,8 @@ class GatewayUsageLogger:
         model: str,
         usage_kind: str,
         operation: str,
+        source_component: str | None = None,
+        source_id: str | None = None,
         raw_usage: Any = None,
         provider_request_id: str | None = None,
         task_id: str | None = None,
@@ -120,8 +122,8 @@ class GatewayUsageLogger:
             return False
         payload = build_usage_event(
             metered_call=metered_call,
-            source_component=self.source_component,
-            source_id=self.source_id,
+            source_component=(source_component or self.source_component),
+            source_id=(source_id or self.source_id),
             provider=provider,
             model=model,
             usage_kind=usage_kind,

@@ -150,6 +150,14 @@ class GenerateEmbeddingsRequest(BaseModel):
     max_parallel_requests: int = Field(default=4, ge=1, le=16)
     encoding_format: Literal["base64_int8", "base64_binary"] = "base64_int8"
     normalize: bool = True
+    usage_operation: str | None = Field(default=None, max_length=160)
+    usage_source_component: str | None = Field(default=None, max_length=120)
+    usage_source_id: str | None = Field(default=None, max_length=200)
+    usage_request_id: str | None = Field(default=None, max_length=120)
+    usage_session_id: str | None = Field(default=None, max_length=120)
+    usage_task_id: str | None = Field(default=None, max_length=120)
+    usage_route: str | None = Field(default=None, max_length=80)
+    usage_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerateEmbeddingsResponse(BaseModel):

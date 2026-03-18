@@ -72,6 +72,14 @@ class PerplexityStandardEmbeddingService:
         max_parallel = max(1, request.max_parallel_requests)
         encoding_format = request.encoding_format or self.encoding_format
         normalize = request.normalize
+        usage_operation = (request.usage_operation or "").strip() or "memory.embed"
+        usage_source_component = (request.usage_source_component or "").strip() or None
+        usage_source_id = (request.usage_source_id or "").strip() or None
+        usage_request_id = (request.usage_request_id or "").strip() or None
+        usage_session_id = (request.usage_session_id or "").strip() or None
+        usage_task_id = (request.usage_task_id or "").strip() or None
+        usage_route = (request.usage_route or "").strip() or None
+        usage_metadata = dict(request.usage_metadata or {})
 
         semaphore = asyncio.Semaphore(max_parallel)
         tasks = [
@@ -83,6 +91,14 @@ class PerplexityStandardEmbeddingService:
                     encoding_format=encoding_format,
                     normalize=normalize,
                     semaphore=semaphore,
+                    usage_operation=usage_operation,
+                    usage_source_component=usage_source_component,
+                    usage_source_id=usage_source_id,
+                    usage_request_id=usage_request_id,
+                    usage_session_id=usage_session_id,
+                    usage_task_id=usage_task_id,
+                    usage_route=usage_route,
+                    usage_metadata=usage_metadata,
                 )
             )
             for offset, texts in _chunked_with_offsets(request.texts, batch_size)
@@ -121,6 +137,14 @@ class PerplexityStandardEmbeddingService:
         encoding_format: str,
         normalize: bool,
         semaphore: asyncio.Semaphore,
+        usage_operation: str,
+        usage_source_component: str | None,
+        usage_source_id: str | None,
+        usage_request_id: str | None,
+        usage_session_id: str | None,
+        usage_task_id: str | None,
+        usage_route: str | None,
+        usage_metadata: dict[str, Any],
     ) -> _BatchEmbeddingResult:
         async with semaphore:
             kwargs: dict[str, Any] = {
@@ -134,12 +158,20 @@ class PerplexityStandardEmbeddingService:
 
             response = await self._create_with_retry(
                 usage_metadata={
+                    **usage_metadata,
                     "text_count": len(texts),
                     "dimensions": dimensions,
                     "encoding_format": encoding_format,
                     "normalize": normalize,
                     "batch_offset": offset,
                 },
+                usage_operation=usage_operation,
+                usage_source_component=usage_source_component,
+                usage_source_id=usage_source_id,
+                usage_request_id=usage_request_id,
+                usage_session_id=usage_session_id,
+                usage_task_id=usage_task_id,
+                usage_route=usage_route,
                 **kwargs,
             )
 
@@ -169,7 +201,19 @@ class PerplexityStandardEmbeddingService:
             usage=_parse_usage(getattr(response, "usage", None)),
         )
 
-    async def _create_with_retry(self, *, usage_metadata: dict[str, Any] | None = None, **kwargs):
+    async def _create_with_retry(
+        self,
+        *,
+        usage_metadata: dict[str, Any] | None = None,
+        usage_operation: str,
+        usage_source_component: str | None,
+        usage_source_id: str | None,
+        usage_request_id: str | None,
+        usage_session_id: str | None,
+        usage_task_id: str | None,
+        usage_route: str | None,
+        **kwargs,
+    ):
         attempt = 0
         while True:
             metered_call = begin_metered_call(prefix="call")
@@ -180,6 +224,13 @@ class PerplexityStandardEmbeddingService:
                     response=response,
                     success=True,
                     error_code=None,
+                    usage_operation=usage_operation,
+                    usage_source_component=usage_source_component,
+                    usage_source_id=usage_source_id,
+                    usage_request_id=usage_request_id,
+                    usage_session_id=usage_session_id,
+                    usage_task_id=usage_task_id,
+                    usage_route=usage_route,
                     metadata_json={
                         **(usage_metadata or {}),
                         "attempt": attempt + 1,
@@ -192,6 +243,13 @@ class PerplexityStandardEmbeddingService:
                     response=None,
                     success=False,
                     error_code=type(exc).__name__,
+                    usage_operation=usage_operation,
+                    usage_source_component=usage_source_component,
+                    usage_source_id=usage_source_id,
+                    usage_request_id=usage_request_id,
+                    usage_session_id=usage_session_id,
+                    usage_task_id=usage_task_id,
+                    usage_route=usage_route,
                     metadata_json={
                         **(usage_metadata or {}),
                         "attempt": attempt + 1,
@@ -230,6 +288,13 @@ class PerplexityStandardEmbeddingService:
         response: Any,
         success: bool,
         error_code: str | None,
+        usage_operation: str,
+        usage_source_component: str | None,
+        usage_source_id: str | None,
+        usage_request_id: str | None,
+        usage_session_id: str | None,
+        usage_task_id: str | None,
+        usage_route: str | None,
         metadata_json: dict[str, Any] | None,
     ) -> None:
         if self._usage_logger is None:
@@ -240,9 +305,15 @@ class PerplexityStandardEmbeddingService:
                 provider="perplexity",
                 model=self.model_name,
                 usage_kind="embedding",
-                operation="memory.embed",
+                operation=usage_operation,
+                source_component=usage_source_component,
+                source_id=usage_source_id,
                 raw_usage=getattr(response, "usage", None),
                 provider_request_id=extract_provider_request_id(response),
+                task_id=usage_task_id,
+                session_id=usage_session_id,
+                request_id=usage_request_id,
+                route=usage_route,
                 success=success,
                 error_code=error_code,
                 metadata_json=metadata_json,

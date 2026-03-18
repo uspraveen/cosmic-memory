@@ -70,6 +70,14 @@ def test_perplexity_embedding_service_emits_usage_per_provider_batch() -> None:
                     dimensions=128,
                     batch_size=2,
                     max_parallel_requests=1,
+                    usage_operation="gateway.capability_wishlist.embed_item",
+                    usage_source_component="gateway",
+                    usage_source_id="gateway:capability_wishlist",
+                    usage_request_id="req_wishlist_1",
+                    usage_session_id="sess_wishlist_1",
+                    usage_task_id="tsk_wishlist_1",
+                    usage_route="internal",
+                    usage_metadata={"wishlist_operation": "capture"},
                 )
             )
         finally:
@@ -78,10 +86,17 @@ def test_perplexity_embedding_service_emits_usage_per_provider_batch() -> None:
         assert len(usage_logger.events) == 2
         assert usage_logger.events[0]["provider"] == "perplexity"
         assert usage_logger.events[0]["model"] == "pplx-embed-v1-4b"
-        assert usage_logger.events[0]["operation"] == "memory.embed"
+        assert usage_logger.events[0]["operation"] == "gateway.capability_wishlist.embed_item"
+        assert usage_logger.events[0]["source_component"] == "gateway"
+        assert usage_logger.events[0]["source_id"] == "gateway:capability_wishlist"
+        assert usage_logger.events[0]["request_id"] == "req_wishlist_1"
+        assert usage_logger.events[0]["session_id"] == "sess_wishlist_1"
+        assert usage_logger.events[0]["task_id"] == "tsk_wishlist_1"
+        assert usage_logger.events[0]["route"] == "internal"
         assert usage_logger.events[0]["provider_request_id"] == "pplx_embed_req_1"
         assert getattr(usage_logger.events[0]["raw_usage"], "prompt_tokens") == 2
         assert usage_logger.events[0]["metadata_json"]["text_count"] == 2
+        assert usage_logger.events[0]["metadata_json"]["wishlist_operation"] == "capture"
         assert usage_logger.events[1]["metadata_json"]["text_count"] == 1
 
     asyncio.run(run())
