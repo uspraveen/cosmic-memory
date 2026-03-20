@@ -16,3 +16,9 @@ class RecordStatus(StrEnum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
     DELETED = "deleted"
+
+
+class CoreFactConfirmationStatus(StrEnum):
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+    CONTESTED = "contested"

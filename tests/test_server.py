@@ -67,10 +67,14 @@ def test_core_fact_endpoint():
             "canonical_key": "preferences.response_style",
             "priority": 300,
             "always_include": True,
+            "confirmation_status": "confirmed",
+            "created_in_session_id": "sess_123",
+            "created_by_tool": "memory_write_core_fact",
             "tags": ["preference"],
             "metadata": {},
             "provenance": {
                 "source_kind": "gateway",
+                "source_id": "req_123",
                 "created_by": "test",
             },
         },
@@ -82,6 +86,11 @@ def test_core_fact_endpoint():
     payload = block_response.json()
     assert len(payload["items"]) == 1
     assert "User prefers concise answers." in payload["rendered"]
+    assert payload["items"][0]["confirmation_status"] == "confirmed"
+    assert payload["items"][0]["created_in_session_id"] == "sess_123"
+    assert payload["items"][0]["created_by_tool"] == "memory_write_core_fact"
+    assert payload["items"][0]["source_type"] == "gateway"
+    assert payload["items"][0]["source_id"] == "req_123"
 
 
 def test_graph_control_endpoints():

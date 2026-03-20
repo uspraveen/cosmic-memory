@@ -1,6 +1,6 @@
 """Domain models and enums for cosmic-memory."""
 
-from cosmic_memory.domain.enums import MemoryKind, RecordStatus
+from cosmic_memory.domain.enums import CoreFactConfirmationStatus, MemoryKind, RecordStatus
 from cosmic_memory.domain.models import (
     ActiveRecallRequest,
     ActiveRecallResponse,
@@ -22,6 +22,7 @@ from cosmic_memory.domain.models import (
 __all__ = [
     "ActiveRecallRequest",
     "ActiveRecallResponse",
+    "CoreFactConfirmationStatus",
     "CoreFactBlock",
     "CoreFactItem",
     "GraphEntity",

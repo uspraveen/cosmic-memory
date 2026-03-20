@@ -175,9 +175,16 @@ class QdrantHybridMemoryIndex:
                 "token_count": snapshot.token_count,
                 "content": record.content,
                 "source_kind": record.provenance.source_kind if record.provenance else None,
+                "source_id": record.provenance.source_id if record.provenance else None,
                 "confidence": record.metadata.get("confidence"),
                 "canonical_key": record.metadata.get("canonical_key"),
                 "always_include": record.metadata.get("always_include"),
+                "confirmation_status": record.metadata.get("confirmation_status"),
+                "created_in_session_id": record.metadata.get("created_in_session_id"),
+                "created_by_tool": record.metadata.get("created_by_tool"),
+                "derived_from_assistant_inference": record.metadata.get("derived_from_assistant_inference"),
+                "contested_at": record.metadata.get("contested_at"),
+                "contested_reason": record.metadata.get("contested_reason"),
                 "supersedes": record.supersedes,
             }
             points.append(

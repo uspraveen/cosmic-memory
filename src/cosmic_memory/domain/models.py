@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from cosmic_memory.domain.enums import MemoryKind, RecordStatus
+from cosmic_memory.domain.enums import CoreFactConfirmationStatus, MemoryKind, RecordStatus
 
 
 def utc_now() -> datetime:
@@ -90,6 +90,12 @@ class WriteCoreFactRequest(BaseModel):
     canonical_key: str | None = None
     priority: int = 100
     always_include: bool = True
+    confirmation_status: CoreFactConfirmationStatus = CoreFactConfirmationStatus.CONFIRMED
+    created_in_session_id: str | None = None
+    created_by_tool: str | None = None
+    derived_from_assistant_inference: bool = False
+    contested_at: datetime | None = None
+    contested_reason: str | None = None
     tags: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     provenance: MemoryProvenance
@@ -100,6 +106,18 @@ class WriteCoreFactRequest(BaseModel):
             metadata["canonical_key"] = self.canonical_key
         metadata["priority"] = self.priority
         metadata["always_include"] = self.always_include
+        metadata["confirmation_status"] = self.confirmation_status.value
+        if self.created_in_session_id is not None:
+            metadata["created_in_session_id"] = self.created_in_session_id
+        elif self.provenance.session_id is not None:
+            metadata["created_in_session_id"] = self.provenance.session_id
+        if self.created_by_tool is not None:
+            metadata["created_by_tool"] = self.created_by_tool
+        metadata["derived_from_assistant_inference"] = self.derived_from_assistant_inference
+        if self.contested_at is not None:
+            metadata["contested_at"] = self.contested_at.isoformat()
+        if self.contested_reason is not None:
+            metadata["contested_reason"] = self.contested_reason
         return WriteMemoryRequest(
             kind=MemoryKind.CORE_FACT,
             content=self.fact,
@@ -118,6 +136,14 @@ class CoreFactItem(BaseModel):
     priority: int = 100
     always_include: bool = True
     tags: list[str] = Field(default_factory=list)
+    confirmation_status: CoreFactConfirmationStatus = CoreFactConfirmationStatus.CONFIRMED
+    source_type: str | None = None
+    source_id: str | None = None
+    created_in_session_id: str | None = None
+    created_by_tool: str | None = None
+    derived_from_assistant_inference: bool = False
+    contested_at: datetime | None = None
+    contested_reason: str | None = None
 
 
 class CoreFactBlock(BaseModel):
@@ -181,6 +207,13 @@ class RecallItem(BaseModel):
     canonical_key: str | None = None
     always_include: bool | None = None
     supersedes: str | None = None
+    confirmation_status: CoreFactConfirmationStatus | None = None
+    source_id: str | None = None
+    created_in_session_id: str | None = None
+    created_by_tool: str | None = None
+    derived_from_assistant_inference: bool | None = None
+    contested_at: datetime | None = None
+    contested_reason: str | None = None
     score_breakdown: dict[str, float] | None = None
 
 

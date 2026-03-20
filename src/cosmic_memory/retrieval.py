@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from time import perf_counter
 
-from cosmic_memory.domain.enums import MemoryKind, RecordStatus
+from cosmic_memory.domain.enums import CoreFactConfirmationStatus, MemoryKind, RecordStatus
 from cosmic_memory.domain.models import (
     ActiveRecallResponse,
     ActiveRecallDiagnostics,
@@ -559,6 +559,7 @@ def approx_token_count(text: str) -> int:
 
 def recall_item_from_record(record: MemoryRecord, *, score: float) -> RecallItem:
     confidence = _coerce_confidence(record.metadata.get("confidence"))
+    confirmation_status = _coerce_confirmation_status(record.metadata.get("confirmation_status"))
     return RecallItem(
         memory_id=record.memory_id,
         kind=record.kind,
@@ -573,6 +574,16 @@ def recall_item_from_record(record: MemoryRecord, *, score: float) -> RecallItem
         canonical_key=_coerce_str(record.metadata.get("canonical_key")),
         always_include=_coerce_bool(record.metadata.get("always_include")),
         supersedes=record.supersedes,
+        confirmation_status=confirmation_status,
+        source_id=record.provenance.source_id if record.provenance else None,
+        created_in_session_id=_coerce_str(record.metadata.get("created_in_session_id"))
+        or (record.provenance.session_id if record.provenance else None),
+        created_by_tool=_coerce_str(record.metadata.get("created_by_tool")),
+        derived_from_assistant_inference=_coerce_bool(
+            record.metadata.get("derived_from_assistant_inference")
+        ),
+        contested_at=record.metadata.get("contested_at"),
+        contested_reason=_coerce_str(record.metadata.get("contested_reason")),
     )
 
 
@@ -595,7 +606,26 @@ def recall_item_from_payload(payload: dict, *, score: float, point_id=None) -> R
         canonical_key=_coerce_str(payload.get("canonical_key")),
         always_include=_coerce_bool(payload.get("always_include")),
         supersedes=_coerce_str(payload.get("supersedes")),
+        confirmation_status=_coerce_confirmation_status(payload.get("confirmation_status")),
+        source_id=_coerce_str(payload.get("source_id")),
+        created_in_session_id=_coerce_str(payload.get("created_in_session_id")),
+        created_by_tool=_coerce_str(payload.get("created_by_tool")),
+        derived_from_assistant_inference=_coerce_bool(
+            payload.get("derived_from_assistant_inference")
+        ),
+        contested_at=payload.get("contested_at"),
+        contested_reason=_coerce_str(payload.get("contested_reason")),
     )
+
+
+def _coerce_confirmation_status(value: object) -> CoreFactConfirmationStatus | None:
+    normalized = _coerce_str(value)
+    if not normalized:
+        return None
+    try:
+        return CoreFactConfirmationStatus(normalized)
+    except ValueError:
+        return None
 
 
 def _passive_bonus(
